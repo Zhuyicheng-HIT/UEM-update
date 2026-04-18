@@ -40,7 +40,7 @@ Download the SMPL-X model from [here](https://smpl-x.is.tue.mpg.de/) and set a p
 See [DATASET.md](DATASET.md) to download and setup the dataset. This is required to run the model.
 
 ## Pretrained UniEgoMotion Model
-Download the pretrained model from [here](https://downloads.cs.stanford.edu/simurgh/chpatel/uem_v4b_dinov2.zip) and place it in the `exp/` directory.
+Download the pretrained model from [here](https://downloads.cs.stanford.edu/simurgh/chpatel/uem_v4b_dinov2.zip) or [here](https://huggingface.co/datasets/chaitanya100100/uniegomotion/tree/main) and place it in the `exp/` directory.
 
 ## Visualizing UniEgoMotion Outputs
 Run the following command to visualize UniEgoMotion outputs on some validation samples for all three tasks.
