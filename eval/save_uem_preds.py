@@ -7,12 +7,14 @@ import joblib
 import numpy as np
 import pytorch_lightning as pl
 import torch
+import torch.distributed as dist
 from loguru import logger
 from tqdm.auto import tqdm
 
 from config.defaults import get_cfg
 from dataset.ee4d_motion_dataset import EE4D_Motion_DataModule, careful_collate_fn
 from dataset.ee4d_motion_dataset import EE4D_Motion_Dataset
+from module.ema import apply_ema_weights_from_checkpoint
 from module.uem_module import UEM_Module, UEM_Module_TwoStage
 from utils.torch_utils import to_device
 
@@ -23,9 +25,16 @@ from utils.torch_utils import to_device
 
 
 def main():
-    device = torch.device("cuda")
+    world_size = int(os.environ.get("WORLD_SIZE", "1"))
+    rank = int(os.environ.get("RANK", "0"))
+    local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+    distributed = world_size > 1
+    if distributed:
+        torch.cuda.set_device(local_rank)
+        dist.init_process_group(backend="nccl")
+    device = torch.device("cuda", local_rank)
 
-    pl.seed_everything(62, workers=True)
+    pl.seed_everything(62 + rank, workers=True)
     sys.argv = sys.argv + [
         "TRAIN.ONLY_VALIDATE",
         "True",
@@ -40,7 +49,10 @@ def main():
     # save path
     save_path = f"{cfg.TRAIN.EXP_PATH}/preds_{ds_name}_{cfg.TRAIN.EVAL_TASK}{cfg.TRAIN.EVAL_SUFFIX}.pkl"
     if os.path.exists(save_path):
-        print(f"Preds already computed at {save_path}")
+        if rank == 0:
+            print(f"Preds already computed at {save_path}")
+        if distributed:
+            dist.destroy_process_group()
         return
 
     # dataset
@@ -65,7 +77,12 @@ def main():
             ckpt_path = os.path.join(cfg.TRAIN.EXP_PATH, "last.ckpt")
         assert os.path.exists(ckpt_path), f"Checkpoint path {ckpt_path} does not exist"
         logger.info(f"Loading model from {ckpt_path}")
-        model = UEM_Module.load_from_checkpoint(ckpt_path, cfg=cfg, map_location="cpu").to(device).eval()
+        model = UEM_Module.load_from_checkpoint(ckpt_path, cfg=cfg, map_location="cpu")
+        checkpoint = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+        if apply_ema_weights_from_checkpoint(model.model, checkpoint):
+            logger.info("Using EMA weights stored in the checkpoint for evaluation.")
+        del checkpoint
+        model = model.to(device).eval()
     else:
         model = UEM_Module_TwoStage(cfg=cfg).to(device).eval()
 
@@ -106,12 +123,19 @@ def main():
     # --------------------------------------------
 
     all_preds = {}
-    batch_size = 64
+    batch_size = cfg.EVAL.BATCH_SIZE
     batch = []
 
     # We evaluate every 10th sample to make evaluation manageable.
     # Considering the segment_stride of 2 seconds, this will evaluate one 8 second sample every 20 seconds (200 frames).
-    for idx in tqdm(range(0, len(ds), 10)):
+    eval_indices = list(range(0, len(ds), 10))
+    if cfg.EVAL.NUM_SAMPLES > 0:
+        eval_indices = eval_indices[: cfg.EVAL.NUM_SAMPLES]
+    local_indices = eval_indices[rank::world_size]
+    logger.info(
+        f"Rank {rank}/{world_size}: evaluating {len(local_indices)} of {len(eval_indices)} samples"
+    )
+    for idx in tqdm(local_indices, disable=rank != 0):
         sample = ds[idx]
         sample = ds.process_sample_for_task(sample, cfg.TRAIN.EVAL_TASK)
         batch.append(sample)
@@ -124,9 +148,34 @@ def main():
         all_preds = process_batch(batch, all_preds)
         batch = []
 
-    # dump metric data
-    joblib.dump(all_preds, save_path)
-    logger.info(f"Preds saved at {save_path}")
+    # Each rank writes a private shard. Rank zero merges them atomically so no
+    # process can overwrite another rank's predictions.
+    shard_path = f"{save_path}.rank-{rank:02d}-of-{world_size:02d}.part"
+    joblib.dump(all_preds, shard_path)
+    if distributed:
+        dist.barrier(device_ids=[local_rank])
+
+    if rank == 0:
+        merged_preds = {}
+        shard_paths = [f"{save_path}.rank-{r:02d}-of-{world_size:02d}.part" for r in range(world_size)]
+        for path in shard_paths:
+            shard = joblib.load(path)
+            duplicate_keys = merged_preds.keys() & shard.keys()
+            if duplicate_keys:
+                raise RuntimeError(f"Duplicate prediction keys across ranks: {sorted(duplicate_keys)[:5]}")
+            merged_preds.update(shard)
+        if len(merged_preds) != len(eval_indices):
+            raise RuntimeError(f"Expected {len(eval_indices)} predictions, got {len(merged_preds)}")
+        tmp_save_path = save_path + ".tmp"
+        joblib.dump(merged_preds, tmp_save_path)
+        os.replace(tmp_save_path, save_path)
+        for path in shard_paths:
+            os.remove(path)
+        logger.info(f"Saved {len(merged_preds)} predictions at {save_path}")
+
+    if distributed:
+        dist.barrier(device_ids=[local_rank])
+        dist.destroy_process_group()
     # IPython.embed()
 
 

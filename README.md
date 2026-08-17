@@ -34,10 +34,21 @@ pip3 install torch --index-url https://download.pytorch.org/whl/cu118
 pip3 install pytorch_lightning==2.4.0
 pip3 install -r requirements.txt
 ```
-Download the SMPL-X model from [here](https://smpl-x.is.tue.mpg.de/) and set a proper path in `get_smpl` function in `dataset/smpl_utils.py`.
+Download **SMPL-X v1.1** from [here](https://smpl-x.is.tue.mpg.de/download.php) and extract
+`SMPLX_NEUTRAL.npz` to `body_models/smplx/`. Alternatively, set `SMPLX_MODEL_PATH` to the directory
+containing `SMPLX_NEUTRAL.npz`.
 
 ## EE4D-Motion Dataset
 See [DATASET.md](DATASET.md) to download and setup the dataset. This is required to run the model.
+Set `UEM_DATA_DIR` to the extracted `ee4d_motion_uniegomotion` directory, or place it at
+`data/ee4d_motion_uniegomotion`.
+
+## Flow Matching Experiments (E1–E12)
+
+The Flow Matching implementation, B0/E1–E12 configurations, launch/evaluation scripts, and
+reproducibility notes are documented in [ablation/README.md](ablation/README.md). The 256-sample
+ablation results and inference benchmark are reported in [result.md](result.md). Generated
+checkpoints, predictions, dataset files, and SMPL-X model files are intentionally not versioned.
 
 ## Pretrained UniEgoMotion Model
 Download the pretrained model from [here](https://downloads.cs.stanford.edu/simurgh/chpatel/uem_v4b_dinov2.zip) or [here](https://huggingface.co/datasets/chaitanya100100/uniegomotion/tree/main) and place it in the `exp/` directory.

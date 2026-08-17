@@ -1,4 +1,5 @@
 import copy
+import math
 import numpy as np
 import torch
 import torch.nn as nn
@@ -18,6 +19,132 @@ def mask_it(mask, cond, replace_token):
     mask_token = replace_token.view(*expand_dims, -1)  # 1 x ... x D
     cond = cond * (1.0 - mask) + mask * mask_token
     return cond
+
+
+class GlobalLocalOutputHead(nn.Module):
+    """Decode a shared feature sequence with separate local/global branches.
+
+    The global representation occupies a contiguous slice in the original
+    feature vector, while the local representation is the concatenation of
+    everything before and after that slice.  Both directional gates are
+    always evaluated.  A constant activity mask selects the experiment's
+    fusion topology, which keeps the parameter set and DDP graph identical
+    for all four topology ablations.
+    """
+
+    MODES = {
+        "no_fusion",
+        "local_to_global",
+        "global_to_local",
+        "bidirectional",
+    }
+
+    def __init__(
+        self,
+        latent_dim,
+        output_dim,
+        global_start,
+        global_end,
+        mode,
+        dropout=0.1,
+        gate_init=-4.0,
+        stop_gradient=True,
+    ):
+        super().__init__()
+        mode = str(mode).lower()
+        if mode not in self.MODES:
+            raise ValueError(
+                f"Unsupported global/local branch mode {mode!r}; "
+                f"expected one of {sorted(self.MODES)}."
+            )
+        if not 0 <= global_start < global_end <= output_dim:
+            raise ValueError(
+                "The global output slice must satisfy "
+                f"0 <= start < end <= {output_dim}, got [{global_start}, {global_end})."
+            )
+
+        self.mode = mode
+        self.output_dim = int(output_dim)
+        self.global_start = int(global_start)
+        self.global_end = int(global_end)
+        self.global_dim = self.global_end - self.global_start
+        self.local_dim = self.output_dim - self.global_dim
+        self.stop_gradient = bool(stop_gradient)
+
+        def make_adapter():
+            return nn.Sequential(
+                nn.LayerNorm(latent_dim),
+                nn.Linear(latent_dim, latent_dim),
+                nn.SiLU(),
+                nn.Dropout(dropout),
+                nn.LayerNorm(latent_dim),
+            )
+
+        self.local_adapter = make_adapter()
+        self.global_adapter = make_adapter()
+        self.local_output = nn.Linear(latent_dim, self.local_dim)
+        self.global_output = nn.Linear(latent_dim, self.global_dim)
+
+        # Per-channel gates can select which branch features to exchange.  A
+        # sigmoid(-4) starts at ~0.018, so the initial model is close to the
+        # no-fusion variant without blocking gradients to an active gate.
+        self.local_to_global_gate = nn.Parameter(torch.full((latent_dim,), float(gate_init)))
+        self.global_to_local_gate = nn.Parameter(torch.full((latent_dim,), float(gate_init)))
+
+        local_to_global_active = mode in {"local_to_global", "bidirectional"}
+        global_to_local_active = mode in {"global_to_local", "bidirectional"}
+        self.register_buffer(
+            "local_to_global_active",
+            torch.tensor(float(local_to_global_active)),
+            persistent=False,
+        )
+        self.register_buffer(
+            "global_to_local_active",
+            torch.tensor(float(global_to_local_active)),
+            persistent=False,
+        )
+
+    def _source_feature(self, feature):
+        return feature.detach() if self.stop_gradient else feature
+
+    def fusion_gate_values(self):
+        """Return effective mean gate strengths for lightweight monitoring."""
+        return {
+            "local_to_global": self.local_to_global_active
+            * torch.sigmoid(self.local_to_global_gate).mean(),
+            "global_to_local": self.global_to_local_active
+            * torch.sigmoid(self.global_to_local_gate).mean(),
+        }
+
+    def forward(self, shared_feature):
+        local_base = self.local_adapter(shared_feature)
+        global_base = self.global_adapter(shared_feature)
+
+        local_to_global = (
+            self.local_to_global_active
+            * torch.sigmoid(self.local_to_global_gate)
+            * self._source_feature(local_base)
+        )
+        global_to_local = (
+            self.global_to_local_active
+            * torch.sigmoid(self.global_to_local_gate)
+            * self._source_feature(global_base)
+        )
+
+        global_feature = global_base + local_to_global
+        local_feature = local_base + global_to_local
+        local_output = self.local_output(local_feature)
+        global_output = self.global_output(global_feature)
+
+        # Local is non-contiguous in v4_beta: [0:start] + [end:output_dim].
+        return torch.cat(
+            (
+                local_output[..., : self.global_start],
+                global_output,
+                local_output[..., self.global_start :],
+            ),
+            dim=-1,
+        )
 
 
 class UniEgoMotion(nn.Module):
@@ -40,6 +167,14 @@ class UniEgoMotion(nn.Module):
         self.cond_betas = cfg.DATA.COND_BETAS
         self.encoder_tsfm = cfg.MODEL.ENCODER_TSFM
         self.finetune_type = cfg.MODEL.FINETUNE_TYPE
+        self.output_branch_mode = str(getattr(cfg.MODEL, "OUTPUT_BRANCH_MODE", "single")).lower()
+
+        self.generative_type = str(getattr(cfg.MODEL, "GENERATIVE_TYPE", "diffusion")).lower()
+        flow_types = {"flow", "flow_matching", "flow-matching"}
+        diffusion_types = {"diffusion", "gaussian_diffusion", "ddpm"}
+        if self.generative_type not in flow_types | diffusion_types:
+            raise ValueError(f"Unsupported MODEL.GENERATIVE_TYPE: {self.generative_type}")
+        self.is_flow_matching = self.generative_type in flow_types
 
         if self.finetune_type is not None:
             assert self.finetune_type in ["gen", "fore", "recon"]
@@ -81,6 +216,7 @@ class UniEgoMotion(nn.Module):
         self.embed_traj_cond = nn.Linear(traj_dim, self.latent_dim)
         self.embed_clip_cond = nn.Linear(self.img_feat_dim, self.latent_dim)
         self.embed_text_cond = nn.Linear(768, self.latent_dim)  # Not used
+        self.embed_text_cond.requires_grad_(False)
 
         if self.cond_betas:
             self.embed_betas = nn.Linear(10, self.latent_dim)
@@ -106,6 +242,10 @@ class UniEgoMotion(nn.Module):
                 }
             )
 
+        # Keep these keys for old checkpoint compatibility, but exclude the
+        # unused text condition parameters from DDP gradient synchronization.
+        self.mask_tokens["text"].requires_grad_(False)
+
         if self.encoder_tsfm is not None:
             assert self.encoder_tsfm in ["add"]
             logger.warning("Using encoder.")
@@ -117,7 +257,39 @@ class UniEgoMotion(nn.Module):
                 [DecoderBlock(self.latent_dim, self.num_heads, self.dropout, 2) for _ in range(self.num_layers)]
             )
 
-        self.output_process = nn.Linear(self.latent_dim, self.input_feats)
+        if self.output_branch_mode == "single":
+            self.output_process = nn.Linear(self.latent_dim, self.input_feats)
+            self.global_local_output = None
+        else:
+            if cfg.MODEL.LEARN_TRAJ:
+                raise ValueError("Global/local output branches are not supported with MODEL.LEARN_TRAJ.")
+            if self.repre_type not in {"v4_beta", "v5_beta"} or self.input_feats != 243:
+                raise ValueError(
+                    "Global/local output branches require the 243D v4_beta or v5_beta representation, "
+                    f"got {self.repre_type!r} with {self.input_feats} features."
+                )
+            self.output_process = None
+            self.global_local_output = GlobalLocalOutputHead(
+                latent_dim=self.latent_dim,
+                output_dim=self.input_feats,
+                global_start=cfg.FLOW.GLOBAL_FEATURE_START,
+                global_end=cfg.FLOW.GLOBAL_FEATURE_END,
+                mode=self.output_branch_mode,
+                dropout=self.dropout,
+                gate_init=getattr(cfg.MODEL, "FUSION_GATE_INIT", -4.0),
+                stop_gradient=getattr(cfg.MODEL, "FUSION_STOP_GRAD", True),
+            )
+            logger.warning(
+                "Using Global/Local output branches: "
+                f"mode={self.output_branch_mode}, "
+                f"global=[{cfg.FLOW.GLOBAL_FEATURE_START}, {cfg.FLOW.GLOBAL_FEATURE_END}), "
+                f"stop_gradient={getattr(cfg.MODEL, 'FUSION_STOP_GRAD', True)}."
+            )
+
+    def fusion_gate_values(self):
+        if self.global_local_output is None:
+            return {}
+        return self.global_local_output.fusion_gate_values()
 
     def mask_cond_finetune(self, cond, cond_type, cond_mask=None):
         # cond: B x T x ... x D
@@ -212,11 +384,11 @@ class UniEgoMotion(nn.Module):
         y: dict
         """
         if cond_scale is not None:
-            assert diffusion is not None
             x_cond = self.forward(x, timesteps, y)  # conditional output
             x_uncond = self.forward(x, timesteps, {"valid_frames": y["valid_frames"]})  # unconditional output
 
-            assert self.cfg.MODEL.PREDICT_XSTART
+            # Both predicted x_start (diffusion) and velocity (flow matching)
+            # support classifier-free guidance by linear output interpolation.
             x_scaled = x_uncond + (x_cond - x_uncond) * cond_scale
             return x_scaled
 
@@ -285,10 +457,19 @@ class UniEgoMotion(nn.Module):
             for dec in self.tsfm:
                 x = dec(x=x, context=context, mask=mask, context_mask=context_mask)
 
-        x = self.output_process(x[:, 1 : 1 + T])  # B x T x (J x F)
+        x = x[:, 1 : 1 + T]
+        if self.global_local_output is None:
+            x = self.output_process(x)  # B x T x (J x F)
+        else:
+            x = self.global_local_output(x)
         x = x.view(B, T, F)
 
         if "repaint_mask" in y:
+            if self.is_flow_matching:
+                raise ValueError(
+                    "Flow Matching cannot apply repaint inside the velocity model; "
+                    "known values must be constrained along the interpolation path in the sampler."
+                )
             assert self.cfg.MODEL.PREDICT_XSTART
             repaint_mask = y["repaint_mask"]
             repaint_value = y["repaint_value"]
@@ -317,10 +498,19 @@ class PositionalEncoding(nn.Module):
 
 
 class TimestepEmbedder(nn.Module):
-    def __init__(self, latent_dim, pos_enc):
+    def __init__(self, latent_dim, pos_enc, min_period=4e-3, max_period=4.0):
         super().__init__()
         self.latent_dim = latent_dim
         self.pos_enc = pos_enc  # .pe is 1 x Tmax x D
+
+        if not 0 < min_period < max_period:
+            raise ValueError(f"Expected 0 < min_period < max_period, got {min_period} and {max_period}.")
+        half_dim = self.latent_dim // 2
+        periods = torch.exp(torch.linspace(math.log(min_period), math.log(max_period), half_dim))
+        angular_frequencies = (2.0 * math.pi) / periods
+        # Non-persistent keeps state_dict keys compatible with existing
+        # diffusion checkpoints while still following module device moves.
+        self.register_buffer("continuous_angular_frequencies", angular_frequencies, persistent=False)
 
         time_embed_dim = self.latent_dim
         self.time_embed = nn.Sequential(
@@ -331,7 +521,22 @@ class TimestepEmbedder(nn.Module):
 
     def forward(self, timesteps):
         # timesteps is (B,)
-        t = self.pos_enc.pe[0, timesteps]  # B x D
+        if timesteps.ndim != 1:
+            raise ValueError(f"Expected one timestep per batch item, got shape {tuple(timesteps.shape)}.")
+
+        if timesteps.dtype.is_floating_point:
+            # OpenPI-style continuous sin/cos features. Flow time is expected
+            # in [0, 1], with t=0 at data and t=1 at Gaussian noise.
+            continuous_time = timesteps.to(dtype=torch.float32)
+            frequencies = self.continuous_angular_frequencies.to(dtype=torch.float32)
+            angles = continuous_time[:, None] * frequencies[None, :]
+            t = torch.cat((torch.sin(angles), torch.cos(angles)), dim=-1)
+            if t.shape[-1] < self.latent_dim:
+                t = torch.cat((t, torch.zeros_like(t[:, :1])), dim=-1)
+            t = t.to(dtype=self.time_embed[0].weight.dtype)
+        else:
+            # Preserve the original discrete diffusion embedding exactly.
+            t = self.pos_enc.pe[0, timesteps.long()]  # B x D
         return self.time_embed(t)  # B x D
 
 

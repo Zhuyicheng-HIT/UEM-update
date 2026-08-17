@@ -306,23 +306,38 @@ class EE4D_Motion_DataModule(pl.LightningDataModule):
         logger.info(f"Val dataset: {len(self.val_dataset)}")
 
     def val_dataloader(self, shuffle=False):
+        num_workers = self.cfg.DATA.NUM_WORKERS
+        loader_kwargs = dict(
+            pin_memory=getattr(self.cfg.DATA, "PIN_MEMORY", False),
+            persistent_workers=getattr(self.cfg.DATA, "PERSISTENT_WORKERS", False) and num_workers > 0,
+        )
+        if num_workers > 0:
+            loader_kwargs["prefetch_factor"] = getattr(self.cfg.DATA, "PREFETCH_FACTOR", 2)
         return DataLoader(
             self.val_dataset,
             batch_size=self.cfg.DATA.BATCH_SIZE,
-            num_workers=self.cfg.DATA.NUM_WORKERS,
+            num_workers=num_workers,
             shuffle=shuffle,
             collate_fn=careful_collate_fn,
-            # pin_memory=False,
+            **loader_kwargs,
         )
 
     def train_dataloader(self):
+        num_workers = self.cfg.DATA.NUM_WORKERS
+        loader_kwargs = dict(
+            pin_memory=getattr(self.cfg.DATA, "PIN_MEMORY", False),
+            persistent_workers=getattr(self.cfg.DATA, "PERSISTENT_WORKERS", False) and num_workers > 0,
+        )
+        if num_workers > 0:
+            loader_kwargs["prefetch_factor"] = getattr(self.cfg.DATA, "PREFETCH_FACTOR", 2)
         return DataLoader(
             self.train_dataset,
             batch_size=self.cfg.DATA.BATCH_SIZE,
-            num_workers=self.cfg.DATA.NUM_WORKERS,
+            num_workers=num_workers,
             shuffle=True,
             collate_fn=careful_collate_fn,
-            # pin_memory=False,
+            drop_last=getattr(self.cfg.DATA, "DROP_LAST", False),
+            **loader_kwargs,
         )
 
 

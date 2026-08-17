@@ -67,6 +67,14 @@ class EMA(Callback):
             if not isinstance(optim, EMAOptimizer)
         ]
 
+    def on_save_checkpoint(
+        self, trainer: "pl.Trainer", pl_module: "pl.LightningModule", checkpoint: Dict[str, Any]
+    ) -> None:
+        del trainer, pl_module
+        # ModelCheckpoint runs after this callback, so model state contains
+        # train weights and optimizer_states[0]["ema"] contains EMA weights.
+        checkpoint["ema_state_format"] = "original_model_with_ema_optimizer_v1"
+
     def on_validation_start(self, trainer: "pl.Trainer", pl_module: "pl.LightningModule") -> None:
         if self._should_validate_ema_weights(trainer):
             self.swap_model_weights(trainer)
@@ -147,6 +155,31 @@ class EMA(Callback):
                     "Unable to find the associated EMA weights when re-loading, "
                     f"training will start with new EMA weights. Expected them to be at: {ema_path}",
                 )
+
+
+@torch.no_grad()
+def apply_ema_weights_from_checkpoint(module, checkpoint):
+    """Apply EMA tensors from checkpoints written by the v1 callback ordering."""
+    if checkpoint.get("ema_state_format") != "original_model_with_ema_optimizer_v1":
+        return False
+
+    optimizer_states = checkpoint.get("optimizer_states", [])
+    if not optimizer_states or "ema" not in optimizer_states[0]:
+        raise KeyError(
+            "Checkpoint declares original_model_with_ema_optimizer_v1, "
+            "but optimizer_states[0]['ema'] is missing."
+        )
+    ema_weights = optimizer_states[0]["ema"]
+    trainable_parameters = [parameter for parameter in module.parameters() if parameter.requires_grad]
+    if len(ema_weights) != len(trainable_parameters):
+        raise ValueError(
+            f"EMA checkpoint has {len(ema_weights)} tensors, but the model has "
+            f"{len(trainable_parameters)} trainable parameters."
+        )
+
+    for parameter, ema_weight in zip(trainable_parameters, ema_weights):
+        parameter.copy_(ema_weight.to(device=parameter.device, dtype=parameter.dtype))
+    return True
 
 
 @torch.no_grad()

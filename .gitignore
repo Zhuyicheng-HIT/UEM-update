@@ -1,7 +1,15 @@
 __pycache__/
+.pytest_cache/
 *.py[cod]
 *$py.class
+*.orig
+*.log
+*.ckpt
+events.out.tfevents.*
 **/.DS_Store
 exp/
+data/
+datasets/
 jnb/
 .vscode/
+body_models/

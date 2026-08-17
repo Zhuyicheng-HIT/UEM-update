@@ -1,15 +1,17 @@
+import math
 import os
 import pytorch_lightning as pl
 import torch
 import torch.distributed
 from loguru import logger
-from torch.optim.lr_scheduler import ReduceLROnPlateau, StepLR
+from torch.optim.lr_scheduler import LambdaLR, StepLR
 
 from model.uniegomotion import UniEgoMotion
 from model.motion_lstm import Motion_LSTM
 from model.motion_unet import Motion_Unet
 
 from module.utils import cfg_to_dict, create_gaussian_diffusion
+from mydiffusion.flow_matching import FlowMatching
 from mydiffusion.resample import create_named_schedule_sampler
 from mydiffusion.gaussian_diffusion import sum_flat
 
@@ -41,28 +43,66 @@ class UEM_Module(pl.LightningModule):
         if self.is_lstm:
             return
 
-        self.diffusion = create_gaussian_diffusion(cfg)
-
-        self.schedule_sampler_type = "uniform"
-        # self.schedule_sampler_type = "loss-second-moment"
-        self.schedule_sampler = create_named_schedule_sampler(self.schedule_sampler_type, self.diffusion)
+        self.generative_type = getattr(cfg.MODEL, "GENERATIVE_TYPE", "diffusion").lower()
+        if self.generative_type in {"flow", "flow_matching"}:
+            flow_cfg = cfg.FLOW
+            self.flow = FlowMatching(
+                num_steps=flow_cfg.NUM_STEPS,
+                solver=flow_cfg.SOLVER,
+                beta_alpha=flow_cfg.BETA_ALPHA,
+                beta_beta=flow_cfg.BETA_BETA,
+                t_min=flow_cfg.T_MIN,
+                prediction_type=flow_cfg.PREDICTION_TYPE,
+                global_weight=flow_cfg.GLOBAL_WEIGHT,
+                global_feature_start=flow_cfg.GLOBAL_FEATURE_START,
+                global_feature_end=flow_cfg.GLOBAL_FEATURE_END,
+                global_rotation_weight=getattr(flow_cfg, "GLOBAL_ROT_WEIGHT", None),
+                global_translation_weight=getattr(flow_cfg, "GLOBAL_TRANS_WEIGHT", None),
+            )
+            self.diffusion = None
+            self.schedule_sampler_type = None
+            self.schedule_sampler = None
+        elif self.generative_type == "diffusion":
+            self.diffusion = create_gaussian_diffusion(cfg)
+            self.flow = None
+            self.schedule_sampler_type = "uniform"
+            self.schedule_sampler = create_named_schedule_sampler(self.schedule_sampler_type, self.diffusion)
+        else:
+            raise ValueError(
+                f"Unknown generative type {self.generative_type!r}; expected 'diffusion' or 'flow'."
+            )
         self.last_iters = []
 
     def configure_optimizers(self):
+        fused = getattr(self.cfg.TRAIN, "FUSED_ADAMW", False) and torch.cuda.is_available()
         optimizer = torch.optim.AdamW(
             [p for p in self.model.parameters() if p.requires_grad],
             lr=self.cfg.TRAIN.LR,
             weight_decay=self.cfg.TRAIN.WEIGHT_DECAY,
-            # fused=True,
+            fused=fused,
         )
-        # return optimizer
 
-        # scheduler = ReduceLROnPlateau(optimizer, "min", factor=0.5, patience=15, verbose=True)
-        scheduler = StepLR(optimizer, self.cfg.TRAIN.NUM_EPOCHS - 50, gamma=0.1)
+        scheduler_name = getattr(self.cfg.TRAIN, "SCHEDULER", "step").lower()
+        if scheduler_name == "cosine_warmup":
+            warmup_epochs = max(0, getattr(self.cfg.TRAIN, "WARMUP_EPOCHS", 0))
+            total_epochs = getattr(self.cfg.TRAIN, "SCHEDULER_TOTAL_EPOCHS", 0)
+            if total_epochs <= 0:
+                total_epochs = self.cfg.TRAIN.NUM_EPOCHS
+            min_lr_ratio = getattr(self.cfg.TRAIN, "MIN_LR_RATIO", 0.1)
+
+            def lr_lambda(epoch):
+                if warmup_epochs > 0 and epoch < warmup_epochs:
+                    return float(epoch + 1) / float(warmup_epochs)
+                progress = (epoch - warmup_epochs) / max(1, total_epochs - warmup_epochs - 1)
+                cosine = 0.5 * (1.0 + math.cos(math.pi * min(max(progress, 0.0), 1.0)))
+                return min_lr_ratio + (1.0 - min_lr_ratio) * cosine
+
+            scheduler = LambdaLR(optimizer, lr_lambda)
+        else:
+            scheduler = StepLR(optimizer, max(1, self.cfg.TRAIN.NUM_EPOCHS - 50), gamma=0.1)
         return [optimizer], [
             {
                 "scheduler": scheduler,
-                # "monitor": "val/loss_epoch",
                 "interval": "epoch",
             }
         ]
@@ -96,6 +136,39 @@ class UEM_Module(pl.LightningModule):
             return loss
 
         x = batch["misc"]["traj"] if self.learn_traj else batch["misc"]["motion"]
+        if self.generative_type in {"flow", "flow_matching"}:
+            losses = self.flow.training_losses(self.model, x, model_kwargs={"y": batch["y"]})
+            loss = losses["loss"].mean()
+            self.log(
+                f"{mode}/loss",
+                loss,
+                on_step=mode == "train",
+                on_epoch=True,
+                sync_dist=True,
+                batch_size=x.shape[0],
+            )
+            for group_name in ("local_mse", "global_mse"):
+                if group_name in losses:
+                    self.log(
+                        f"{mode}/{group_name}",
+                        losses[group_name].mean(),
+                        on_step=mode == "train",
+                        on_epoch=True,
+                        sync_dist=True,
+                        batch_size=x.shape[0],
+                    )
+            gate_values = self.model.fusion_gate_values() if hasattr(self.model, "fusion_gate_values") else {}
+            for direction, gate in gate_values.items():
+                self.log(
+                    f"{mode}/fusion_gate_{direction}",
+                    gate,
+                    on_step=False,
+                    on_epoch=True,
+                    sync_dist=True,
+                    batch_size=x.shape[0],
+                )
+            return loss
+
         t, weights = self.schedule_sampler.sample(x.shape[0], self.device)
         losses = self.diffusion.training_losses(self.model, x, t, model_kwargs={"y": batch["y"]})
         if mode == "train" and self.schedule_sampler_type != "uniform":
@@ -136,6 +209,16 @@ class UEM_Module(pl.LightningModule):
         # B = y["traj"].shape[0]
         for k, v in y.items():
             assert len(v) == B, f"y[{k}] has batch size {len(v)} but expected {B}"
+        if self.generative_type in {"flow", "flow_matching"}:
+            return self.flow.sample_loop(
+                self.model,
+                (B, self.window, self.model.input_feats),
+                model_kwargs={"y": y, "cond_scale": cond_scale},
+                noise=None,
+                progress=False,
+                return_all_pred_xstart=return_all_pred_xstart,
+            )
+
         x = self.diffusion.p_sample_loop(
             self.model,
             (B, self.window, self.model.input_feats),

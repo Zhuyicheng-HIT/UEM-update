@@ -1,13 +1,24 @@
+import os
+from pathlib import Path
+
 from loguru import logger
 import smplx
 import torch
 
 
 def get_smpl(smpl_type="smplx"):
-
-    smpl_path = "/vision/u/chpatel/smpl_data"  # TODO: change this to your own path
     logger.warning(f"Loading SMPL model: {smpl_type}")
     assert smpl_type in ["smplx"]
+
+    default_model_path = Path(__file__).resolve().parents[1] / "body_models" / smpl_type
+    smpl_path = Path(os.environ.get("SMPLX_MODEL_PATH", default_model_path)).expanduser()
+    model_file = smpl_path / "SMPLX_NEUTRAL.npz"
+    if not model_file.is_file():
+        raise FileNotFoundError(
+            f"SMPL-X neutral model not found at {model_file}. "
+            "Download SMPL-X v1.1 and extract it there, or set SMPLX_MODEL_PATH "
+            "to the directory containing SMPLX_NEUTRAL.npz."
+        )
 
     # Load SMPL
     # joint_mapper = JointMapper(smpl_to_openpose(smpl_type, use_hands=args.use_hands, use_face=False))
@@ -17,7 +28,8 @@ def get_smpl(smpl_type="smplx"):
     # Rest of the joints are other helper joints (e.g. for openpose) and face contours.
     smpl_layer_cls = {"smpl": smplx.SMPLLayer, "smplx": smplx.SMPLXLayer}[smpl_type]
     smpl = smpl_layer_cls(
-        f"{smpl_path}/{smpl_type}",
+        str(smpl_path),
+        ext="npz",
         gender="NEUTRAL",
         use_pca=True,
         # joint_mapper=joint_mapper,
@@ -26,7 +38,7 @@ def get_smpl(smpl_type="smplx"):
     return smpl
 
 
-def evaluate_smpl(smpl, smpl_params, max_parallel_smpl_evals=1000):
+def evaluate_smpl(smpl, smpl_params, max_parallel_smpl_evals=1000, return_joints_only=False):
     kp3d = []
     verts = []
     full_pose = []
@@ -44,13 +56,21 @@ def evaluate_smpl(smpl, smpl_params, max_parallel_smpl_evals=1000):
             smpl_params_batch["right_hand_pose"] = smpl_params["right_hand_pose"][i : i + bs]
 
         with torch.no_grad():
-            smpl_output = smpl(**smpl_params_batch, return_full_pose=True)
+            smpl_output = smpl(
+                **smpl_params_batch,
+                return_verts=not return_joints_only,
+                return_full_pose=not return_joints_only,
+            )
 
         kp3d.append(smpl_output.joints)
-        verts.append(smpl_output.vertices)
-        full_pose.append(smpl_output.full_pose)
+        if not return_joints_only:
+            verts.append(smpl_output.vertices)
+            full_pose.append(smpl_output.full_pose)
 
     kp3d = torch.cat(kp3d, dim=0)
+    if return_joints_only:
+        return kp3d
+
     verts = torch.cat(verts, dim=0)
     full_pose = torch.cat(full_pose, dim=0)
 
