@@ -222,3 +222,67 @@ git merge --allow-unrelated-histories -s ours sxh/main \
 ```
 
 远端原始 README 仍完整保存在 `e3bb229` 中。合并后只允许显式向 `sxh` 的 `main` 做普通 push；如果服务器拒绝认证或分支策略检查，则停止且不改写远端历史。
+
+合并命令执行成功，`sxh/main` 已成为本地 `main` 的祖先。随后执行三次非写入 dry-run：
+
+```bash
+timeout 60s env GIT_TERMINAL_PROMPT=0 GIT_ASKPASS=/bin/false \
+  git push --dry-run --no-verify sxh HEAD:refs/heads/main
+timeout 60s env GIT_TERMINAL_PROMPT=0 GIT_ASKPASS=/bin/false \
+  git -c http.lowSpeedLimit=1 -c http.lowSpeedTime=30 \
+  push --dry-run --no-verify sxh HEAD:refs/heads/main
+timeout 60s env GIT_TERMINAL_PROMPT=0 GIT_ASKPASS=/bin/false \
+  git push --dry-run --no-verify \
+  https://sxh-kk@github.com/sxh-kk/ExpectionToSmplx.git \
+  HEAD:refs/heads/main
+```
+
+结果：第一次遇到瞬时 TLS 连接终止；第二次到达认证阶段后提示无法读取 GitHub 用户名；第三次显式给出用户名后提示无法读取密码/Token。当前环境仍无目标仓库的写入凭据，所以正式 push 没有执行。远端 `main` 仍停留在 `e3bb229`，没有发生部分上传或历史覆盖。
+
+## SSH deploy key 配置
+
+为避免在命令、remote URL 或日志中存放 GitHub Token，改用仅授权给 `ExpectionToSmplx` 的独立 SSH deploy key。现有 `ssh_worker_rsa_key` 经显式测试未被 GitHub 接受，因此未复用、未修改：
+
+```bash
+ssh-keygen -lf /root/.ssh/ssh_worker_rsa_key.pub
+timeout 20s ssh -i /root/.ssh/ssh_worker_rsa_key \
+  -o IdentitiesOnly=yes -o BatchMode=yes \
+  -o StrictHostKeyChecking=accept-new -T git@github.com </dev/null
+```
+
+专用 key 的生成与本地配置命令：
+
+```bash
+umask 077
+ssh-keygen -q -t ed25519 \
+  -C 'sxh-kk/ExpectionToSmplx deploy key' \
+  -f /root/.ssh/github_sxh_kk_expectiontosmplx_ed25519 -N ''
+chmod 600 /root/.ssh/github_sxh_kk_expectiontosmplx_ed25519
+chmod 644 /root/.ssh/github_sxh_kk_expectiontosmplx_ed25519.pub
+ssh-keygen -lf /root/.ssh/github_sxh_kk_expectiontosmplx_ed25519.pub
+chmod 600 /root/.ssh/config
+git remote set-url sxh \
+  git@github-sxh-kk-expectiontosmplx:sxh-kk/ExpectionToSmplx.git
+```
+
+`/root/.ssh/config` 中的专用 Host alias 固定使用该私钥并启用 `IdentitiesOnly yes`。私钥权限为 600，未输出、未加入 Git；公钥指纹为 `SHA256:V1gFGvWkolFuMP46HItZjecHiYT4ewQ+I5ev1fMmOlk`。下一步需要仓库管理员在 GitHub 的 `Settings → Deploy keys` 中添加对应公钥并勾选 `Allow write access`，之后再测试 SSH 和执行 push。
+
+## SSH 授权与最终上传
+
+仓库管理员添加 deploy key 并授予写权限后，执行：
+
+```bash
+timeout 20s ssh -o BatchMode=yes \
+  -o StrictHostKeyChecking=accept-new \
+  -T github-sxh-kk-expectiontosmplx </dev/null
+timeout 60s env GIT_TERMINAL_PROMPT=0 \
+  git push --dry-run --no-verify sxh HEAD:refs/heads/main
+```
+
+结果：SSH 返回 GitHub 的成功认证提示并识别为 `sxh-kk/ExpectionToSmplx`；退出码 1 是 GitHub 不提供交互式 shell 的预期行为。dry-run 退出码为 0，确认 `main` 可从远端 `e3bb229` 普通快进到本地提交。日志并入最终 merge commit 后，重新 dry-run 并执行：
+
+```bash
+GIT_TERMINAL_PROMPT=0 git push sxh HEAD:refs/heads/main
+```
+
+该命令只更新 `sxh/ExpectionToSmplx` 的 `main`，不操作上游 `origin`，不使用 force push。
