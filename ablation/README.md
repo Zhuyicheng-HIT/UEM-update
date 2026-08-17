@@ -283,6 +283,40 @@ loss = sum(weight × squared_error) / sum(weight)
 
 `GLOBAL_WEIGHT: 1.0` 与原始所有维度等权 MSE 完全一致。
 
+## E13--E16：显式任务采样与课程学习
+
+这四组实验都继承 E7 的 `x0 + GLOBAL_WEIGHT=8 + Euler10`，保持约
+84k optimizer steps。任务映射固定为 `recon=0, fore=1, gen=2`。
+
+- **E13**：固定显式采样，Recon/Fore/Gen 为 `0.4/0.3/0.3`。
+- **E14**：在 E13 上增加可学习 task embedding。
+- **E15**：在 E14 上按完整条件到稀疏条件执行固定课程；累计任务预算仍约为
+  `0.4/0.3/0.3`。
+- **E16**：前 60% 与 E15 相同，之后依据确定性三任务 validation flow loss
+  调整 replay 概率。每次只移动 0.05，单任务概率限制在 `[0.15, 0.55]`。
+
+显式任务条件同时生成 condition mask 和独立 `loss_mask`：Recon 监督全部有效帧；
+Generation 只观察第一张图并监督全部有效帧；Forecasting 观察前 20 帧图像/轨迹，
+仅监督未来有效帧。原始 padding 信息保存在 `padding_mask`，不会因生成完整 80 帧而
+进入训练损失。
+
+配置与入口：
+
+```text
+ablation/configs/e13_explicit_tasks_w8_u84k.yaml
+ablation/configs/e14_explicit_task_token_w8_u84k.yaml
+ablation/configs/e15_motion_curriculum_w8_u84k.yaml
+ablation/configs/e16_adaptive_curriculum_w8_u84k.yaml
+
+ablation/scripts/train_e13_explicit_tasks.sh
+ablation/scripts/train_e14_explicit_task_token.sh
+ablation/scripts/train_e15_motion_curriculum.sh
+ablation/scripts/train_e16_adaptive_curriculum.sh
+```
+
+E16 的在线代理只用于调训练任务比例，最终选择仍应使用完整评测中的
+J/J-PA/J-H/Head Translation，而不是 validation flow loss。
+
 ### E3：增加更新次数
 
 保持 velocity、全局权重 1 和 Euler 10 不变，只把训练从约 84k updates 增加到约 168k updates，用于判断当前模型是否欠训练。

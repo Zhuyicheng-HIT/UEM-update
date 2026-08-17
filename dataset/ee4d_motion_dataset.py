@@ -15,6 +15,7 @@ from dataset.representation_utils import repre_to_full_sequence, saved_sequence_
 from dataset.smpl_utils import get_smpl, evaluate_smpl
 from utils.vis_utils import save_video, visualize_sequence, visualize_sequence_blender
 from utils.torch_utils import careful_collate_fn
+from utils.task_conditioning import apply_task_conditioning
 from dataset.feats import ImageFeats
 
 
@@ -228,26 +229,13 @@ class EE4D_Motion_Dataset(Dataset):
         return mdata if is_batch else {k: v[0] for k, v in mdata.items()}
 
     def process_sample_for_task(self, ret, task):
-        if task == "recon":
-            return ret
-        if task == "gen":
-            ret = copy.deepcopy(ret)
-            ret["y"]["traj_mask"] = torch.ones(self.window).long()  # T
-            ret["y"]["img_mask"] = torch.ones(self.window).long()  # T
-            ret["y"]["img_mask"][0] = 0  # first frame is visible, everything else is masked out.
-            ret["y"]["valid_frames"] = torch.ones_like(ret["y"]["valid_frames"])  # generate full T frames
-            return ret
-        if task in ["fore"]:
-            ret = copy.deepcopy(ret)
-            ret["y"]["traj_mask"] = torch.ones(self.window).long()  # T
-            ret["y"]["img_mask"] = torch.ones(self.window).long()  # T
-
-            avail = min(self.window // 4, ret["y"]["valid_frames"].sum())
-            ret["y"]["traj_mask"][:avail] = 0  # 20 frames are visible
-            ret["y"]["img_mask"][:avail] = 0  # 20 frames are visible
-            ret["y"]["valid_frames"] = torch.ones_like(ret["y"]["valid_frames"])  # generate full T frames
-
-            return ret
+        ret = copy.deepcopy(ret)
+        ret["y"] = apply_task_conditioning(
+            ret["y"],
+            task,
+            forecast_prefix=self.window // 4,
+        )
+        return ret
 
     def visualize_sample(self, ret, use_blender=False):
 

@@ -78,6 +78,7 @@ def main():
         log_every_n_steps=cfg.TRAIN.LOG_EVERY_N_STEPS,
         callbacks=callbacks,
         max_epochs=cfg.TRAIN.NUM_EPOCHS,
+        max_steps=getattr(cfg.TRAIN, "MAX_STEPS", -1),
         check_val_every_n_epoch=cfg.TRAIN.CHECK_VAL_EVERY_N_EPOCHS,
         accumulate_grad_batches=getattr(cfg.TRAIN, "ACCUMULATE_GRAD_BATCHES", 1),
         gradient_clip_algorithm="norm",

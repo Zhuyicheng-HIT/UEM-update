@@ -11,9 +11,11 @@ from model.motion_lstm import Motion_LSTM
 from model.motion_unet import Motion_Unet
 
 from module.utils import cfg_to_dict, create_gaussian_diffusion
+from module.task_sampler import ExplicitTaskSchedule
 from mydiffusion.flow_matching import FlowMatching
 from mydiffusion.resample import create_named_schedule_sampler
 from mydiffusion.gaussian_diffusion import sum_flat
+from utils.task_conditioning import TASKS, apply_task_conditioning
 
 
 class UEM_Module(pl.LightningModule):
@@ -26,6 +28,11 @@ class UEM_Module(pl.LightningModule):
         self.window = self.cfg.DATA.WINDOW
         self.model_name = cfg.MODEL.MODEL_NAME
         self.learn_traj = cfg.MODEL.LEARN_TRAJ
+        self.task_sampler_enabled = bool(getattr(cfg.TRAIN.TASK_SAMPLER, "ENABLED", False))
+        self.task_schedule = None
+        self.forecast_prefix = int(getattr(cfg.TRAIN.TASK_SAMPLER, "FORECAST_PREFIX", self.window // 4))
+        self._adaptive_val_sums = None
+        self._adaptive_val_counts = None
         if self.learn_traj:
             assert not self.cfg.DATA.COND_TRAJ
 
@@ -41,6 +48,8 @@ class UEM_Module(pl.LightningModule):
             raise ValueError(f"Unknown model name {self.model_name}")
 
         if self.is_lstm:
+            if self.task_sampler_enabled:
+                raise ValueError("Explicit E13--E16 task sampling is currently supported only by the flow UEM model.")
             return
 
         self.generative_type = getattr(cfg.MODEL, "GENERATIVE_TYPE", "diffusion").lower()
@@ -71,7 +80,25 @@ class UEM_Module(pl.LightningModule):
             raise ValueError(
                 f"Unknown generative type {self.generative_type!r}; expected 'diffusion' or 'flow'."
             )
+        if self.task_sampler_enabled:
+            if self.generative_type not in {"flow", "flow_matching"}:
+                raise ValueError("Explicit task target masks require MODEL.GENERATIVE_TYPE=flow.")
+            self.task_schedule = ExplicitTaskSchedule.from_config(cfg)
+            logger.warning(
+                "Using explicit task training: "
+                f"mode={self.task_schedule.mode}, total_steps={self.task_schedule.total_steps}, "
+                f"forecast_prefix={self.forecast_prefix}."
+            )
         self.last_iters = []
+
+    def _batch_for_task(self, batch, task):
+        conditioned_batch = dict(batch)
+        conditioned_batch["y"] = apply_task_conditioning(
+            batch["y"],
+            task,
+            forecast_prefix=self.forecast_prefix,
+        )
+        return conditioned_batch
 
     def configure_optimizers(self):
         fused = getattr(self.cfg.TRAIN, "FUSED_ADAMW", False) and torch.cuda.is_available()
@@ -120,6 +147,19 @@ class UEM_Module(pl.LightningModule):
             g["weight_decay"] = self.cfg.TRAIN.WEIGHT_DECAY
 
     def training_step(self, batch, batch_idx, mode="train"):
+        active_task = None
+        if mode == "train" and self.task_schedule is not None:
+            active_task = self.task_schedule.task_for_step(int(self.global_step))
+            batch = self._batch_for_task(batch, active_task)
+            self.log(
+                "train/task_id",
+                float(TASKS.index(active_task)),
+                on_step=True,
+                on_epoch=False,
+                sync_dist=False,
+                batch_size=batch["misc"]["motion"].shape[0],
+            )
+
         if self.is_lstm:
             x = batch["misc"]["traj"] if self.learn_traj else batch["misc"]["motion"]
             y = batch["y"]
@@ -167,6 +207,25 @@ class UEM_Module(pl.LightningModule):
                     sync_dist=True,
                     batch_size=x.shape[0],
                 )
+            if active_task is not None:
+                self.log(
+                    f"train_task/{active_task}_loss",
+                    loss,
+                    on_step=True,
+                    on_epoch=True,
+                    sync_dist=True,
+                    batch_size=x.shape[0],
+                )
+                for task_index, task in enumerate(TASKS):
+                    probability = self.task_schedule.probabilities_for_step(int(self.global_step))[task_index]
+                    self.log(
+                        f"train_task/prob_{task}",
+                        probability,
+                        on_step=True,
+                        on_epoch=False,
+                        sync_dist=False,
+                        batch_size=x.shape[0],
+                    )
             return loss
 
         t, weights = self.schedule_sampler.sample(x.shape[0], self.device)
@@ -198,7 +257,93 @@ class UEM_Module(pl.LightningModule):
         return loss
 
     def validation_step(self, batch, batch_idx, dataloader_idx=0):
+        if self.task_schedule is not None and self.task_schedule.mode == "adaptive":
+            return self._adaptive_validation_step(batch, batch_idx)
         return self.training_step(batch, batch_idx, mode="val")
+
+    def on_validation_epoch_start(self):
+        if self.task_schedule is None or self.task_schedule.mode != "adaptive":
+            return
+        self._adaptive_val_sums = torch.zeros(len(TASKS), device=self.device, dtype=torch.float64)
+        self._adaptive_val_counts = torch.zeros(len(TASKS), device=self.device, dtype=torch.float64)
+
+    def _adaptive_validation_step(self, batch, batch_idx):
+        max_batches = int(getattr(self.cfg.TRAIN.TASK_SAMPLER, "ADAPTIVE_VAL_MAX_BATCHES", 0))
+        if max_batches > 0 and batch_idx >= max_batches:
+            return None
+
+        x = batch["misc"]["traj"] if self.learn_traj else batch["misc"]["motion"]
+        batch_size = x.shape[0]
+        validation_t = float(getattr(self.cfg.TRAIN.TASK_SAMPLER, "ADAPTIVE_VAL_T", 0.75))
+        t = torch.full((batch_size,), validation_t, device=x.device, dtype=torch.float32)
+        generator = torch.Generator(device=x.device)
+        validation_seed = int(getattr(self.cfg.TRAIN.TASK_SAMPLER, "ADAPTIVE_VAL_SEED", 6200))
+        generator.manual_seed(validation_seed + 100003 * int(self.global_rank) + batch_idx)
+        noise = torch.randn(x.shape, device=x.device, dtype=x.dtype, generator=generator)
+
+        task_losses = []
+        for task_index, task in enumerate(TASKS):
+            conditioned_batch = self._batch_for_task(batch, task)
+            terms = self.flow.training_losses(
+                self.model,
+                x,
+                model_kwargs={"y": conditioned_batch["y"]},
+                noise=noise,
+                t=t,
+            )
+            task_loss = terms["loss"]
+            self._adaptive_val_sums[task_index] += task_loss.detach().double().sum()
+            self._adaptive_val_counts[task_index] += task_loss.numel()
+            task_losses.append(task_loss.mean())
+        return torch.stack(task_losses).mean()
+
+    def on_validation_epoch_end(self):
+        if self.task_schedule is None or self.task_schedule.mode != "adaptive":
+            return
+        if self._adaptive_val_sums is None or not bool((self._adaptive_val_counts > 0).any()):
+            return
+
+        sums = self._adaptive_val_sums.clone()
+        counts = self._adaptive_val_counts.clone()
+        if torch.distributed.is_available() and torch.distributed.is_initialized():
+            torch.distributed.all_reduce(sums, op=torch.distributed.ReduceOp.SUM)
+            torch.distributed.all_reduce(counts, op=torch.distributed.ReduceOp.SUM)
+        scores = sums / counts.clamp_min(1.0)
+
+        for task_index, task in enumerate(TASKS):
+            self.log(
+                f"val_task/{task}_flow_loss",
+                scores[task_index].float(),
+                on_step=False,
+                on_epoch=True,
+                sync_dist=False,
+            )
+        changed = self.task_schedule.update_from_scores(scores.tolist(), step=int(self.global_step))
+        for task_index, task in enumerate(TASKS):
+            self.log(
+                f"val_task/prob_{task}",
+                self.task_schedule.current_probabilities[task_index],
+                on_step=False,
+                on_epoch=True,
+                sync_dist=False,
+            )
+        if changed and int(self.global_rank) == 0:
+            logger.warning(
+                "Updated adaptive task replay probabilities at step "
+                f"{int(self.global_step)}: "
+                + ", ".join(
+                    f"{task}={probability:.3f}"
+                    for task, probability in zip(TASKS, self.task_schedule.current_probabilities)
+                )
+            )
+
+    def on_save_checkpoint(self, checkpoint):
+        if self.task_schedule is not None:
+            checkpoint["explicit_task_schedule"] = self.task_schedule.state_dict()
+
+    def on_load_checkpoint(self, checkpoint):
+        if self.task_schedule is not None and "explicit_task_schedule" in checkpoint:
+            self.task_schedule.load_state_dict(checkpoint["explicit_task_schedule"])
 
     def sample(self, y, B=1, cond_scale=None, return_all_pred_xstart=False):
         if self.is_lstm:

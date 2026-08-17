@@ -41,6 +41,10 @@ _C.MODEL.ZERO_MASK_TOKEN = False  # whether to use zero mask token instead of a 
 _C.MODEL.OUTPUT_BRANCH_MODE = "single"
 _C.MODEL.FUSION_GATE_INIT = -4.0
 _C.MODEL.FUSION_STOP_GRAD = True
+# Optional explicit task identity used by E14--E16.  The mapping is fixed to
+# recon=0, fore=1, gen=2 so evaluation and training share checkpoint semantics.
+_C.MODEL.COND_TASK = False
+_C.MODEL.NUM_TASKS = 3
 
 _C.FLOW = CN()
 _C.FLOW.NUM_STEPS = 10
@@ -68,6 +72,7 @@ _C.TRAIN.USE_CKPT_LR = False  # whether to use lr from the checkpoint rather tha
 _C.TRAIN.EXP_PATH = None  # experiment log path to save logs and checkpoints
 
 _C.TRAIN.NUM_EPOCHS = 200
+_C.TRAIN.MAX_STEPS = -1  # positive values stop at an exact optimizer-step budget.
 _C.TRAIN.LOG_EVERY_N_STEPS = 50
 # _C.TRAIN.VAL_CHECK_INTERVAL = 1.0
 _C.TRAIN.CHECK_VAL_EVERY_N_EPOCHS = 1
@@ -94,6 +99,32 @@ _C.TRAIN.PROGRESS_REFRESH_RATE = 1
 _C.TRAIN.EVAL_SUFFIX = ""  # suffix to append to the evaluation and visualization results file
 _C.TRAIN.EVAL_TASK = None  # task to evaluate or visualize. Should be one of ["recon", "gen", "fore"]
 _C.TRAIN.COND_SCALE = None  # classifier free guidance scale. We do not use this for UniEgoMotion evaluation.
+
+# Explicit three-task training used by E13--E16.  When disabled, the original
+# independent random condition masking remains unchanged.
+_C.TRAIN.TASK_SAMPLER = CN()
+_C.TRAIN.TASK_SAMPLER.ENABLED = False
+_C.TRAIN.TASK_SAMPLER.MODE = "fixed"  # fixed, curriculum, adaptive
+_C.TRAIN.TASK_SAMPLER.TOTAL_STEPS = 84000
+_C.TRAIN.TASK_SAMPLER.SEED = 62
+_C.TRAIN.TASK_SAMPLER.FORECAST_PREFIX = 20
+_C.TRAIN.TASK_SAMPLER.FIXED_PROBS = [0.40, 0.30, 0.30]  # recon, fore, gen
+_C.TRAIN.TASK_SAMPLER.CURRICULUM_FRACTIONS = [0.15, 0.20, 0.25, 0.40]
+_C.TRAIN.TASK_SAMPLER.CURRICULUM_RECON_PROBS = [0.80, 0.55, 0.35, 0.20]
+_C.TRAIN.TASK_SAMPLER.CURRICULUM_FORE_PROBS = [0.15, 0.35, 0.35, 0.30]
+_C.TRAIN.TASK_SAMPLER.CURRICULUM_GEN_PROBS = [0.05, 0.10, 0.30, 0.50]
+# E16 updates the final-phase replay mix from deterministic validation flow
+# losses.  This is a stable in-training proxy; paper metrics remain the final
+# selection criterion outside the optimization loop.
+_C.TRAIN.TASK_SAMPLER.ADAPTIVE_START_FRACTION = 0.60
+_C.TRAIN.TASK_SAMPLER.ADAPTIVE_MIN_PROB = 0.15
+_C.TRAIN.TASK_SAMPLER.ADAPTIVE_MAX_PROB = 0.55
+_C.TRAIN.TASK_SAMPLER.ADAPTIVE_SHIFT = 0.05
+_C.TRAIN.TASK_SAMPLER.ADAPTIVE_THRESHOLD = 0.01
+_C.TRAIN.TASK_SAMPLER.ADAPTIVE_UPDATE_INTERVAL = 5000
+_C.TRAIN.TASK_SAMPLER.ADAPTIVE_VAL_MAX_BATCHES = 8
+_C.TRAIN.TASK_SAMPLER.ADAPTIVE_VAL_T = 0.75
+_C.TRAIN.TASK_SAMPLER.ADAPTIVE_VAL_SEED = 6200
 
 _C.EVAL = CN()
 _C.EVAL.KEY_JOINTS_ONLY = False

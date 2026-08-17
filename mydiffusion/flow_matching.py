@@ -228,10 +228,12 @@ class FlowMatching:
         weighted training objective.
         """
         try:
-            valid_frames = model_kwargs["y"]["valid_frames"]
+            conditioning = model_kwargs["y"]
+            valid_frames = conditioning.get("loss_mask", conditioning["valid_frames"])
         except (KeyError, TypeError) as exc:
             raise KeyError(
-                "Flow Matching training requires model_kwargs['y']['valid_frames']."
+                "Flow Matching training requires model_kwargs['y']['valid_frames']; "
+                "an optional loss_mask may further restrict the predicted task region."
             ) from exc
 
         mask = torch.as_tensor(valid_frames, device=error.device)

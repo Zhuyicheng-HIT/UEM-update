@@ -168,6 +168,7 @@ class UniEgoMotion(nn.Module):
         self.encoder_tsfm = cfg.MODEL.ENCODER_TSFM
         self.finetune_type = cfg.MODEL.FINETUNE_TYPE
         self.output_branch_mode = str(getattr(cfg.MODEL, "OUTPUT_BRANCH_MODE", "single")).lower()
+        self.cond_task = bool(getattr(cfg.MODEL, "COND_TASK", False))
 
         self.generative_type = str(getattr(cfg.MODEL, "GENERATIVE_TYPE", "diffusion")).lower()
         flow_types = {"flow", "flow_matching", "flow-matching"}
@@ -217,6 +218,14 @@ class UniEgoMotion(nn.Module):
         self.embed_clip_cond = nn.Linear(self.img_feat_dim, self.latent_dim)
         self.embed_text_cond = nn.Linear(768, self.latent_dim)  # Not used
         self.embed_text_cond.requires_grad_(False)
+        if self.cond_task:
+            num_tasks = int(getattr(cfg.MODEL, "NUM_TASKS", 3))
+            if num_tasks != 3:
+                raise ValueError(
+                    "Explicit task conditioning uses the fixed recon/fore/gen mapping and requires NUM_TASKS=3."
+                )
+            self.embed_task_cond = nn.Embedding(num_tasks, self.latent_dim)
+            logger.warning("Using explicit recon/fore/gen task embeddings.")
 
         if self.cond_betas:
             self.embed_betas = nn.Linear(10, self.latent_dim)
@@ -385,7 +394,11 @@ class UniEgoMotion(nn.Module):
         """
         if cond_scale is not None:
             x_cond = self.forward(x, timesteps, y)  # conditional output
-            x_uncond = self.forward(x, timesteps, {"valid_frames": y["valid_frames"]})  # unconditional output
+            uncond_y = {"valid_frames": y["valid_frames"]}
+            if "task_id" in y:
+                # Task identity is an instruction, not a modality to drop for CFG.
+                uncond_y["task_id"] = y["task_id"]
+            x_uncond = self.forward(x, timesteps, uncond_y)  # unconditional output
 
             # Both predicted x_start (diffusion) and velocity (flow matching)
             # support classifier-free guidance by linear output interpolation.
@@ -400,6 +413,18 @@ class UniEgoMotion(nn.Module):
         img_mask = y["img_mask"] if "img_mask" in y else None
 
         enc_time = self.embed_timestep(timesteps)  # B x D
+        if self.cond_task:
+            task_id = y.get("task_id")
+            if task_id is None:
+                # Raw validation batches are reconstruction batches.
+                task_id = torch.zeros(B, device=x.device, dtype=torch.long)
+            else:
+                task_id = torch.as_tensor(task_id, device=x.device, dtype=torch.long)
+                if task_id.ndim == 0:
+                    task_id = task_id.expand(B)
+                if task_id.shape != (B,):
+                    raise ValueError(f"task_id must have shape ({B},), got {tuple(task_id.shape)}.")
+            enc_time = enc_time + self.embed_task_cond(task_id)
 
         if "traj" in y:  # B x T x F
             enc_traj = self.embed_traj_cond(y["traj"])  # B x T x D

@@ -71,6 +71,35 @@ def test_training_loss_is_per_sample_and_ignores_padding():
     assert terms["loss"].shape == (2,)
 
 
+def test_task_loss_mask_takes_precedence_over_sequence_attention_mask():
+    flow = FlowMatching(prediction_type="x0", global_feature_start=0, global_feature_end=1)
+    x_start = torch.zeros(1, 3, 2)
+    noise = torch.zeros_like(x_start)
+
+    class FrameErrorModel(nn.Module):
+        def forward(self, x, t, **model_kwargs):
+            del t, model_kwargs
+            prediction = torch.ones_like(x)
+            prediction[:, 1] = 2.0
+            prediction[:, 2] = 1000.0
+            return prediction
+
+    terms = flow.training_losses(
+        FrameErrorModel(),
+        x_start,
+        model_kwargs={
+            "y": {
+                "valid_frames": torch.ones(1, 3),
+                "loss_mask": torch.tensor([[0, 1, 0]]),
+            }
+        },
+        noise=noise,
+        t=torch.tensor([0.5]),
+    )
+
+    torch.testing.assert_close(terms["loss"], torch.tensor([4.0]))
+
+
 def test_split_global_weights_reallocate_equal_total_weight():
     feature_dim = 243
     model_kwargs = {"y": {"valid_frames": torch.ones(1, 1, dtype=torch.bool)}}
@@ -201,6 +230,7 @@ if __name__ == "__main__":
     test_oracle_velocity_sign_recovers_xstart_with_both_solvers()
     test_clean_estimate_matches_xstart()
     test_training_loss_is_per_sample_and_ignores_padding()
+    test_task_loss_mask_takes_precedence_over_sequence_attention_mask()
     test_split_global_weights_reallocate_equal_total_weight()
     test_split_global_weights_must_be_configured_together()
     test_group_mse_diagnostics_are_unweighted_and_keep_the_objective_unchanged()
