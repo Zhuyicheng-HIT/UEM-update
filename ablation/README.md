@@ -317,6 +317,97 @@ ablation/scripts/train_e16_adaptive_curriculum.sh
 E16 的在线代理只用于调训练任务比例，最终选择仍应使用完整评测中的
 J/J-PA/J-H/Head Translation，而不是 validation flow loss。
 
+## E17--E20：任务冲突、几何对齐与批内混合
+
+四组实验都以 E14 为唯一基线，保持 `x0 + GLOBAL_WEIGHT=8 + Euler10`、
+global batch 512、固定 `0.4/0.3/0.3` 任务预算和 84k optimizer steps。每组只改变
+一个因素；这里不组合 E17--E20，组合实验应在单项结论明确后另设 E21。
+
+| 实验 | 唯一改动 | 直接目的 | 重点观察指标 |
+| --- | --- | --- | --- |
+| E17 | Global 权重按任务设为 `8/4/4` | 缓解 Recon 与 Fore/Gen 对累计全局轨迹的冲突 | Head Translation、J、J-H |
+| E18 | 12层 Decoder 的三处 pre-norm 后加入 TaskFiLM | 在共享主干内形成轻量任务专属计算路径 | 三任务 J/J-PA/J-H，任务间退化幅度 |
+| E19 | 加入训练期 SMPL-X 55关节几何损失 | 让表示空间训练目标直接对齐最终关节、Root、手足指标 | J、J-PA、Root/Head、手足稳定性 |
+| E20 | 每个 batch 内按样本混合 Recon/Fore/Gen | 降低单步任务梯度方差与任务覆盖顺序影响 | 三任务均值、seed 方差、收敛稳定性 |
+
+### E17：任务相关 Global 权重
+
+`FLOW.TASK_GLOBAL_WEIGHTS: [8, 4, 4]` 按 `task_id` 为每个样本设置
+v4_beta `[198,207)` 的九维全局 SE(3) loss 权重。Local 维仍为1，loss 仍按总权重
+归一化。E17 保留 E14 的逐 step 单任务 batch，不改变采样顺序。它验证 Recon 是否
+需要更强全局约束，而 Fore/Gen 是否因长时累积误差更适合较温和的 Global 梯度。
+
+### E18：逐层 TaskFiLM
+
+每个 DecoderBlock 在 self-attention、cross-attention 和 FFN 的 LayerNorm 输出后使用：
+
+```text
+h_task = h * (1 + gamma[task, layer, sublayer]) + beta[task, layer, sublayer]
+```
+
+`gamma/beta` 全零初始化，所以训练第0步与 E14 完全相同。12层、3任务、3子层、
+scale/shift、768维共增加165,888个参数；不增加额外 Decoder 分支。训练日志
+`train/task_film_abs_mean` 用于确认调制参数确实离开零点。
+
+### E19：SMPL-X Geometry Loss
+
+E19 将 Flow 输出的 `pred_xstart` 反归一化，并通过可微的 v4_beta 解码和 SMPL-X
+55关节前向运动学得到关节。实现只计算 shape-dependent rest joints 和 kinematic tree，
+不生成 mesh vertices；几何分支固定用FP32，推理阶段完全不执行，因此不增加推理参数量
+或NFE。目标为：
+
+```text
+L_geo = L_joint + 2 L_root + L_relative
+      + 0.5 L_hand + 0.1 L_foot_velocity + 0.1 L_foot_height
+L_total = L_flow + warmup * task_scale * 0.1 * L_geo
+```
+
+所有项使用1厘米拐点的 Smooth-L1。`L_relative` 为 pelvis-relative body joints，左右手
+分别相对对应 wrist；足部速度只在真值接触帧监督，足部高度对齐真值接触高度。
+Recon/Fore/Gen 的 `task_scale` 为 `1/1/0.25`，前10k step线性warmup。所有项严格使用
+`loss_mask`，所以 Forecasting 的已观察前20帧和 padding 都不参与几何目标。运行 E19
+需要 `v4_beta_ee_train_stats.pt` 以及 `SMPLX_NEUTRAL.npz`。
+
+### E20：Mixed batch
+
+E20 不复制样本，也不在一个 step 做三次前向；每个样本只随机分配一个任务。任务配额
+先在双卡 global batch 上生成，再按 rank 切分，避免每张卡单独取整。global batch 512
+采用确定性5-step超周期：
+
+```text
+step 1: [205, 154, 153]
+step 2: [205, 153, 154]
+step 3: [205, 154, 153]
+step 4: [205, 153, 154]
+step 5: [204, 154, 154]
+total : [1024, 768, 768] = 40% / 30% / 30%
+```
+
+向量化任务掩码保证一个 batch 内 Recon、Fore、Gen 分别使用正确的 condition mask、
+attention mask 和 loss mask。日志 `train_task/fraction_*` 和 `train_task/*_loss` 用于核查
+实际比例和各任务收敛。
+
+### 配置与运行
+
+```text
+ablation/configs/e17_task_global_weight_w8_u84k.yaml
+ablation/configs/e18_task_film_w8_u84k.yaml
+ablation/configs/e19_smplx_geometry_w8_u84k.yaml
+ablation/configs/e20_mixed_batch_w8_u84k.yaml
+```
+
+从零训练任一实验：
+
+```bash
+python run/train_uem.py CONFIG ablation/configs/e17_task_global_weight_w8_u84k.yaml
+python run/train_uem.py CONFIG ablation/configs/e18_task_film_w8_u84k.yaml
+python run/train_uem.py CONFIG ablation/configs/e19_smplx_geometry_w8_u84k.yaml
+python run/train_uem.py CONFIG ablation/configs/e20_mixed_batch_w8_u84k.yaml
+```
+
+正式比较必须对 E14 和 E17--E20 使用同一验证样本、seed、Euler10、checkpoint选择规则和
+三任务评测脚本。E17--E20 的单项胜负应优先看每个任务的完整指标，不只看训练 Flow loss。
+
 ### E3：增加更新次数
 
 保持 velocity、全局权重 1 和 Euler 10 不变，只把训练从约 84k updates 增加到约 168k updates，用于判断当前模型是否欠训练。

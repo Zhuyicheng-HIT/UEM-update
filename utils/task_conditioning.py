@@ -8,7 +8,7 @@ model's sequence-attention mask.
 
 from __future__ import annotations
 
-from typing import Dict, Mapping
+from typing import Dict, Mapping, Union
 
 import torch
 
@@ -29,7 +29,7 @@ def _as_batched_frames(value: torch.Tensor) -> tuple[torch.Tensor, bool]:
 
 def apply_task_conditioning(
     conditioning: Mapping[str, torch.Tensor],
-    task: str,
+    task: Union[str, torch.Tensor],
     *,
     forecast_prefix: int,
 ) -> Dict[str, torch.Tensor]:
@@ -42,8 +42,6 @@ def apply_task_conditioning(
     still contribute no loss.
     """
 
-    if task not in TASK_TO_ID:
-        raise ValueError(f"Unsupported task {task!r}; expected one of {TASKS}.")
     if forecast_prefix <= 0:
         raise ValueError(f"forecast_prefix must be positive, got {forecast_prefix}.")
     if "valid_frames" not in conditioning:
@@ -55,27 +53,43 @@ def apply_task_conditioning(
     batch_size, window = padding_mask.shape
     device = padding_mask.device
 
+    if isinstance(task, str):
+        if task not in TASK_TO_ID:
+            raise ValueError(f"Unsupported task {task!r}; expected one of {TASKS}.")
+        task_ids = torch.full(
+            (batch_size,), TASK_TO_ID[task], device=device, dtype=torch.long
+        )
+    else:
+        task_ids = torch.as_tensor(task, device=device, dtype=torch.long)
+        if task_ids.ndim == 0:
+            task_ids = task_ids.expand(batch_size)
+        if task_ids.shape != (batch_size,):
+            raise ValueError(
+                f"task IDs must have shape ({batch_size},), got {tuple(task_ids.shape)}."
+            )
+        if bool(torch.any((task_ids < 0) | (task_ids >= len(TASKS)))):
+            raise ValueError(f"task IDs must lie in [0, {len(TASKS) - 1}].")
+
     frame_indices = torch.arange(window, device=device).unsqueeze(0)
     observed_counts = padding_mask.sum(dim=1).clamp(max=min(forecast_prefix, window))
     observed_prefix = frame_indices < observed_counts.unsqueeze(1)
 
-    if task == "recon":
-        condition_mask = torch.zeros_like(padding_mask)
-        attention_mask = padding_mask
-        loss_mask = padding_mask
-    elif task == "fore":
-        condition_mask = ~observed_prefix
-        attention_mask = torch.ones_like(padding_mask)
-        loss_mask = padding_mask & ~observed_prefix
-    else:  # gen
-        condition_mask = torch.ones_like(padding_mask)
-        attention_mask = torch.ones_like(padding_mask)
-        loss_mask = padding_mask
+    recon_rows = task_ids == TASK_TO_ID["recon"]
+    fore_rows = task_ids == TASK_TO_ID["fore"]
+    gen_rows = task_ids == TASK_TO_ID["gen"]
+
+    condition_mask = torch.zeros_like(padding_mask)
+    condition_mask[fore_rows] = ~observed_prefix[fore_rows]
+    condition_mask[gen_rows] = True
+    attention_mask = padding_mask.clone()
+    attention_mask[fore_rows | gen_rows] = True
+    loss_mask = padding_mask.clone()
+    loss_mask[fore_rows] &= ~observed_prefix[fore_rows]
 
     traj_mask = condition_mask
     img_mask = condition_mask.clone()
-    if task == "gen" and window > 0:
-        img_mask[:, 0] = False
+    if window > 0:
+        img_mask[gen_rows, 0] = False
 
     def restore_batch_shape(value: torch.Tensor) -> torch.Tensor:
         return value if was_batched else value[0]
@@ -88,12 +102,7 @@ def apply_task_conditioning(
     result["valid_frames"] = restore_batch_shape(attention_mask.to(dtype=torch.long))
     result["loss_mask"] = restore_batch_shape(loss_mask.to(dtype=torch.long))
     result["padding_mask"] = restore_batch_shape(padding_mask.to(dtype=torch.long))
-    if was_batched:
-        result["task_id"] = torch.full(
-            (batch_size,), TASK_TO_ID[task], device=device, dtype=torch.long
-        )
-    else:
-        result["task_id"] = torch.tensor(TASK_TO_ID[task], device=device, dtype=torch.long)
+    result["task_id"] = task_ids if was_batched else task_ids[0]
     return result
 
 

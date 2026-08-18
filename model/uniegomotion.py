@@ -237,6 +237,14 @@ class UniEgoMotion(nn.Module):
         self.motion_expert_cfg = motion_expert_cfg
         if self.motion_expert_enabled and cfg.MODEL.LEARN_TRAJ:
             raise ValueError("MOTION_EXPERT is a K12 motion model and cannot be combined with LEARN_TRAJ.")
+        self.task_film_enabled = bool(getattr(cfg.MODEL.TASK_FILM, "ENABLED", False))
+        self.num_tasks = int(getattr(cfg.MODEL, "NUM_TASKS", 3))
+        if self.task_film_enabled and not self.cond_task:
+            raise ValueError("MODEL.TASK_FILM.ENABLED requires MODEL.COND_TASK=True.")
+        if self.task_film_enabled and self.encoder_tsfm is not None:
+            raise ValueError("TaskFiLM is defined for the UniEgoMotion decoder, not ENCODER_TSFM.")
+        if self.task_film_enabled and self.motion_expert_enabled:
+            raise ValueError("TaskFiLM and the K12 MoE Motion Expert are separate ablations and cannot be combined.")
 
         self.generative_type = str(getattr(cfg.MODEL, "GENERATIVE_TYPE", "diffusion")).lower()
         flow_types = {"flow", "flow_matching", "flow-matching"}
@@ -320,12 +328,11 @@ class UniEgoMotion(nn.Module):
         self.embed_text_cond = nn.Linear(768, self.latent_dim)  # Not used
         self.embed_text_cond.requires_grad_(False)
         if self.cond_task:
-            num_tasks = int(getattr(cfg.MODEL, "NUM_TASKS", 3))
-            if num_tasks != 3:
+            if self.num_tasks != 3:
                 raise ValueError(
                     "Explicit task conditioning uses the fixed recon/fore/gen mapping and requires NUM_TASKS=3."
                 )
-            self.embed_task_cond = nn.Embedding(num_tasks, self.latent_dim)
+            self.embed_task_cond = nn.Embedding(self.num_tasks, self.latent_dim)
             logger.warning("Using explicit recon/fore/gen task embeddings.")
 
         if self.cond_betas:
@@ -388,9 +395,16 @@ class UniEgoMotion(nn.Module):
                     "router_conditioned": bool(getattr(motion_expert_cfg, "CONDITIONED_ROUTER", True)),
                     "routed_gate_init": float(getattr(motion_expert_cfg, "ROUTED_GATE_INIT", 0.05)),
                 }
+            elif self.task_film_enabled:
+                block_kwargs = {
+                    "task_film": True,
+                    "num_tasks": self.num_tasks,
+                }
             self.tsfm = nn.ModuleList(
                 [block_cls(self.latent_dim, self.num_heads, self.dropout, 2, **block_kwargs) for _ in range(self.num_layers)]
             )
+            if self.task_film_enabled:
+                logger.warning("Using identity-initialized TaskFiLM in all decoder sublayers.")
 
         if self.output_branch_mode == "single":
             self.output_process = nn.Linear(self.latent_dim, self.input_feats)
@@ -468,6 +482,14 @@ class UniEgoMotion(nn.Module):
                     block.ff.initialize_routed_from_shared(noise_std=noise_std)
         logger.warning(f"Initialized Motion Expert from dense K12 state: copied {copied} tensors.")
         return copied
+
+    def task_film_magnitude(self):
+        values = [
+            block.task_film.abs().mean()
+            for block in self.tsfm
+            if getattr(block, "task_film", None) is not None
+        ]
+        return torch.stack(values).mean() if values else None
 
     def mask_cond_finetune(self, cond, cond_type, cond_mask=None):
         # cond: B x T x ... x D
@@ -587,6 +609,7 @@ class UniEgoMotion(nn.Module):
         img_mask = y["img_mask"] if "img_mask" in y else None
 
         enc_time = self.embed_timestep(timesteps)  # B x D
+        task_id = None
         if self.cond_task:
             task_id = y.get("task_id")
             if task_id is None:
@@ -682,6 +705,8 @@ class UniEgoMotion(nn.Module):
                 }
                 if self.motion_expert_enabled:
                     decoder_kwargs["router_conditions"] = router_conditions
+                if self.task_film_enabled:
+                    decoder_kwargs["task_id"] = task_id
                 x = dec(**decoder_kwargs)
 
         if self.motion_expert_enabled:

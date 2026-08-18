@@ -51,6 +51,11 @@ _C.MODEL.FUSION_STOP_GRAD = True
 # recon=0, fore=1, gen=2 so evaluation and training share checkpoint semantics.
 _C.MODEL.COND_TASK = False
 _C.MODEL.NUM_TASKS = 3
+# E18: identity-initialized task modulation after each decoder pre-norm.
+# The task embedding remains enabled, so this only adds task-specific feature
+# scaling/shifting without changing the shared Transformer topology.
+_C.MODEL.TASK_FILM = CN()
+_C.MODEL.TASK_FILM.ENABLED = False
 
 # Optional K12-only Motion Expert.  The default remains the original dense
 # UniEgoMotion backbone so existing experiments/checkpoints are unchanged.
@@ -89,6 +94,10 @@ _C.FLOW.GLOBAL_FEATURE_END = 207
 # GLOBAL_TRANS_WEIGHT. Leaving both as None preserves GLOBAL_WEIGHT exactly.
 _C.FLOW.GLOBAL_ROT_WEIGHT = None
 _C.FLOW.GLOBAL_TRANS_WEIGHT = None
+# E17: optional recon/fore/gen-specific weights for the same global slice.
+# None preserves GLOBAL_WEIGHT exactly. It is mutually exclusive with the
+# rotation/translation split above.
+_C.FLOW.TASK_GLOBAL_WEIGHTS = None
 
 _C.TRAIN = CN()
 _C.TRAIN.LR = 3.0e-5
@@ -130,6 +139,7 @@ _C.TRAIN.COND_SCALE = None  # classifier free guidance scale. We do not use this
 _C.TRAIN.TASK_SAMPLER = CN()
 _C.TRAIN.TASK_SAMPLER.ENABLED = False
 _C.TRAIN.TASK_SAMPLER.MODE = "fixed"  # fixed, curriculum, adaptive
+_C.TRAIN.TASK_SAMPLER.BATCH_MODE = "step"  # step or mixed (E20)
 _C.TRAIN.TASK_SAMPLER.TOTAL_STEPS = 84000
 _C.TRAIN.TASK_SAMPLER.SEED = 62
 _C.TRAIN.TASK_SAMPLER.FORECAST_PREFIX = 20
@@ -150,6 +160,21 @@ _C.TRAIN.TASK_SAMPLER.ADAPTIVE_UPDATE_INTERVAL = 5000
 _C.TRAIN.TASK_SAMPLER.ADAPTIVE_VAL_MAX_BATCHES = 8
 _C.TRAIN.TASK_SAMPLER.ADAPTIVE_VAL_T = 0.75
 _C.TRAIN.TASK_SAMPLER.ADAPTIVE_VAL_SEED = 6200
+
+# E19: training-only differentiable SMPL-X kinematic losses.  The loss uses
+# the 55-joint SMPL-X kinematic tree and never constructs mesh vertices.
+_C.TRAIN.GEOMETRY_LOSS = CN()
+_C.TRAIN.GEOMETRY_LOSS.ENABLED = False
+_C.TRAIN.GEOMETRY_LOSS.WEIGHT = 0.10
+_C.TRAIN.GEOMETRY_LOSS.WARMUP_STEPS = 10000
+_C.TRAIN.GEOMETRY_LOSS.TASK_WEIGHTS = [1.0, 1.0, 0.25]  # recon, fore, gen
+_C.TRAIN.GEOMETRY_LOSS.JOINT_WEIGHT = 1.0
+_C.TRAIN.GEOMETRY_LOSS.ROOT_WEIGHT = 2.0
+_C.TRAIN.GEOMETRY_LOSS.RELATIVE_WEIGHT = 1.0
+_C.TRAIN.GEOMETRY_LOSS.HAND_WEIGHT = 0.5
+_C.TRAIN.GEOMETRY_LOSS.FOOT_VELOCITY_WEIGHT = 0.1
+_C.TRAIN.GEOMETRY_LOSS.FOOT_HEIGHT_WEIGHT = 0.1
+_C.TRAIN.GEOMETRY_LOSS.HUBER_DELTA = 0.01
 
 _C.EVAL = CN()
 _C.EVAL.KEY_JOINTS_ONLY = False
