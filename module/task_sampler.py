@@ -6,6 +6,8 @@ import math
 import random
 from typing import Any, Mapping, Sequence
 
+import torch
+
 from utils.task_conditioning import TASKS
 
 
@@ -185,6 +187,72 @@ class ExplicitTaskSchedule:
 
     def task_for_step(self, step: int) -> str:
         return TASKS[self.task_id_for_step(step)]
+
+    def task_ids_for_batch(
+        self,
+        step: int,
+        local_batch_size: int,
+        *,
+        rank: int = 0,
+        world_size: int = 1,
+        device: torch.device | str | None = None,
+    ) -> torch.Tensor:
+        """Return one deterministic task ID per sample for E20.
+
+        Counts are computed for the complete DDP global batch, then shuffled
+        and sliced by rank. Cumulative largest-remainder rounding removes the
+        persistent one-sample bias that ordinary per-batch rounding creates
+        for a 512-sample 40/30/30 batch.
+        """
+
+        if self.mode != "fixed":
+            raise ValueError("Mixed-batch task sampling currently requires MODE='fixed'.")
+        step = int(step)
+        local_batch_size = int(local_batch_size)
+        rank = int(rank)
+        world_size = int(world_size)
+        if step < 0 or local_batch_size <= 0:
+            raise ValueError("step must be non-negative and local_batch_size must be positive.")
+        if world_size <= 0 or not 0 <= rank < world_size:
+            raise ValueError(f"Invalid DDP rank/world_size pair: rank={rank}, world_size={world_size}.")
+
+        global_batch_size = local_batch_size * world_size
+        # E20's declared global-512 super-cycle. Four batches give Recon the
+        # rounding remainder while Fore/Gen alternate; the fifth batch closes
+        # the 5-step budget exactly at 1024/768/768 samples.
+        is_e20_ratio = all(
+            math.isclose(actual, expected, abs_tol=1.0e-8)
+            for actual, expected in zip(self.fixed_probabilities, (0.4, 0.3, 0.3))
+        )
+        if global_batch_size == 512 and is_e20_ratio:
+            cycle = (
+                (205, 154, 153),
+                (205, 153, 154),
+                (205, 154, 153),
+                (205, 153, 154),
+                (204, 154, 154),
+            )
+            counts = list(cycle[step % len(cycle)])
+        else:
+            counts_before = _largest_remainder_counts(
+                step * global_batch_size, self.fixed_probabilities
+            )
+            counts_after = _largest_remainder_counts(
+                (step + 1) * global_batch_size, self.fixed_probabilities
+            )
+            counts = [after - before for before, after in zip(counts_before, counts_after)]
+        if any(count < 0 for count in counts) or sum(counts) != global_batch_size:
+            raise RuntimeError(f"Invalid mixed-batch task counts at step {step}: {counts}.")
+
+        global_ids = torch.tensor(
+            [task_id for task_id, count in enumerate(counts) for _ in range(count)],
+            dtype=torch.long,
+        )
+        generator = torch.Generator(device="cpu")
+        generator.manual_seed(self.seed + 104729 * step)
+        global_ids = global_ids[torch.randperm(global_batch_size, generator=generator)]
+        start = rank * local_batch_size
+        return global_ids[start : start + local_batch_size].to(device=device)
 
     def probabilities_for_step(self, step: int) -> list[float]:
         step = int(step)

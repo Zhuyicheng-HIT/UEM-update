@@ -12,6 +12,7 @@ from model.motion_unet import Motion_Unet
 
 from module.utils import cfg_to_dict, create_gaussian_diffusion
 from module.task_sampler import ExplicitTaskSchedule
+from module.smplx_geometry_loss import SMPLXGeometryLoss
 from mydiffusion.flow_matching import FlowMatching
 from mydiffusion.resample import create_named_schedule_sampler
 from mydiffusion.gaussian_diffusion import sum_flat
@@ -29,10 +30,16 @@ class UEM_Module(pl.LightningModule):
         self.model_name = cfg.MODEL.MODEL_NAME
         self.learn_traj = cfg.MODEL.LEARN_TRAJ
         self.task_sampler_enabled = bool(getattr(cfg.TRAIN.TASK_SAMPLER, "ENABLED", False))
+        self.task_batch_mode = str(
+            getattr(cfg.TRAIN.TASK_SAMPLER, "BATCH_MODE", "step")
+        ).lower()
+        if self.task_batch_mode not in {"step", "mixed"}:
+            raise ValueError("TRAIN.TASK_SAMPLER.BATCH_MODE must be 'step' or 'mixed'.")
         self.task_schedule = None
         self.forecast_prefix = int(getattr(cfg.TRAIN.TASK_SAMPLER, "FORECAST_PREFIX", self.window // 4))
         self._adaptive_val_sums = None
         self._adaptive_val_counts = None
+        self.geometry_loss = None
         if self.learn_traj:
             assert not self.cfg.DATA.COND_TRAJ
 
@@ -49,7 +56,7 @@ class UEM_Module(pl.LightningModule):
 
         if self.is_lstm:
             if self.task_sampler_enabled:
-                raise ValueError("Explicit E13--E16 task sampling is currently supported only by the flow UEM model.")
+                raise ValueError("Explicit E13--E20 task sampling is currently supported only by the flow UEM model.")
             return
 
         self.generative_type = getattr(cfg.MODEL, "GENERATIVE_TYPE", "diffusion").lower()
@@ -67,6 +74,7 @@ class UEM_Module(pl.LightningModule):
                 global_feature_end=flow_cfg.GLOBAL_FEATURE_END,
                 global_rotation_weight=getattr(flow_cfg, "GLOBAL_ROT_WEIGHT", None),
                 global_translation_weight=getattr(flow_cfg, "GLOBAL_TRANS_WEIGHT", None),
+                task_global_weights=getattr(flow_cfg, "TASK_GLOBAL_WEIGHTS", None),
             )
             self.diffusion = None
             self.schedule_sampler_type = None
@@ -84,10 +92,23 @@ class UEM_Module(pl.LightningModule):
             if self.generative_type not in {"flow", "flow_matching"}:
                 raise ValueError("Explicit task target masks require MODEL.GENERATIVE_TYPE=flow.")
             self.task_schedule = ExplicitTaskSchedule.from_config(cfg)
+            if self.task_batch_mode == "mixed" and self.task_schedule.mode != "fixed":
+                raise ValueError("Mixed-batch task sampling currently requires TASK_SAMPLER.MODE=fixed.")
             logger.warning(
                 "Using explicit task training: "
                 f"mode={self.task_schedule.mode}, total_steps={self.task_schedule.total_steps}, "
-                f"forecast_prefix={self.forecast_prefix}."
+                f"batch_mode={self.task_batch_mode}, forecast_prefix={self.forecast_prefix}."
+            )
+        geometry_enabled = bool(getattr(cfg.TRAIN.GEOMETRY_LOSS, "ENABLED", False))
+        if geometry_enabled:
+            if self.generative_type not in {"flow", "flow_matching"}:
+                raise ValueError("SMPL-X geometry loss currently requires MODEL.GENERATIVE_TYPE=flow.")
+            if not self.task_sampler_enabled:
+                raise ValueError("SMPL-X geometry loss requires explicit recon/fore/gen task masks.")
+            self.geometry_loss = SMPLXGeometryLoss(cfg)
+            logger.warning(
+                "Using training-only differentiable SMPL-X geometry loss "
+                f"with weight={self.geometry_loss.weight}."
             )
         self.last_iters = []
 
@@ -148,17 +169,39 @@ class UEM_Module(pl.LightningModule):
 
     def training_step(self, batch, batch_idx, mode="train"):
         active_task = None
+        mixed_task_ids = None
         if mode == "train" and self.task_schedule is not None:
-            active_task = self.task_schedule.task_for_step(int(self.global_step))
-            batch = self._batch_for_task(batch, active_task)
-            self.log(
-                "train/task_id",
-                float(TASKS.index(active_task)),
-                on_step=True,
-                on_epoch=False,
-                sync_dist=False,
-                batch_size=batch["misc"]["motion"].shape[0],
-            )
+            batch_size = batch["misc"]["motion"].shape[0]
+            if self.task_batch_mode == "mixed":
+                world_size = int(getattr(self.trainer, "world_size", 1))
+                mixed_task_ids = self.task_schedule.task_ids_for_batch(
+                    int(self.global_step),
+                    batch_size,
+                    rank=int(self.global_rank),
+                    world_size=world_size,
+                    device=batch["misc"]["motion"].device,
+                )
+                batch = self._batch_for_task(batch, mixed_task_ids)
+                for task_index, task in enumerate(TASKS):
+                    self.log(
+                        f"train_task/fraction_{task}",
+                        (mixed_task_ids == task_index).float().mean(),
+                        on_step=True,
+                        on_epoch=False,
+                        sync_dist=True,
+                        batch_size=batch_size,
+                    )
+            else:
+                active_task = self.task_schedule.task_for_step(int(self.global_step))
+                batch = self._batch_for_task(batch, active_task)
+                self.log(
+                    "train/task_id",
+                    float(TASKS.index(active_task)),
+                    on_step=True,
+                    on_epoch=False,
+                    sync_dist=False,
+                    batch_size=batch_size,
+                )
 
         if self.is_lstm:
             x = batch["misc"]["traj"] if self.learn_traj else batch["misc"]["motion"]
@@ -177,7 +220,39 @@ class UEM_Module(pl.LightningModule):
 
         x = batch["misc"]["traj"] if self.learn_traj else batch["misc"]["motion"]
         if self.generative_type in {"flow", "flow_matching"}:
-            losses = self.flow.training_losses(self.model, x, model_kwargs={"y": batch["y"]})
+            use_geometry = mode == "train" and self.geometry_loss is not None
+            losses = self.flow.training_losses(
+                self.model,
+                x,
+                model_kwargs={"y": batch["y"]},
+                return_diagnostics=use_geometry,
+            )
+            if use_geometry:
+                flow_loss = losses["loss"]
+                geometry_terms = self.geometry_loss(
+                    losses["pred_xstart"],
+                    x,
+                    batch["y"],
+                    step=int(self.global_step),
+                )
+                losses["loss"] = flow_loss + geometry_terms["loss"]
+                self.log(
+                    "train/flow_loss",
+                    flow_loss.mean(),
+                    on_step=True,
+                    on_epoch=True,
+                    sync_dist=True,
+                    batch_size=x.shape[0],
+                )
+                for name, value in geometry_terms.items():
+                    self.log(
+                        f"train_geometry/{name}",
+                        value.mean(),
+                        on_step=True,
+                        on_epoch=True,
+                        sync_dist=True,
+                        batch_size=x.shape[0],
+                    )
             loss = losses["loss"].mean()
             self.log(
                 f"{mode}/loss",
@@ -207,6 +282,20 @@ class UEM_Module(pl.LightningModule):
                     sync_dist=True,
                     batch_size=x.shape[0],
                 )
+            film_magnitude = (
+                self.model.task_film_magnitude()
+                if hasattr(self.model, "task_film_magnitude")
+                else None
+            )
+            if film_magnitude is not None:
+                self.log(
+                    f"{mode}/task_film_abs_mean",
+                    film_magnitude,
+                    on_step=False,
+                    on_epoch=True,
+                    sync_dist=True,
+                    batch_size=x.shape[0],
+                )
             if active_task is not None:
                 self.log(
                     f"train_task/{active_task}_loss",
@@ -218,6 +307,29 @@ class UEM_Module(pl.LightningModule):
                 )
                 for task_index, task in enumerate(TASKS):
                     probability = self.task_schedule.probabilities_for_step(int(self.global_step))[task_index]
+                    self.log(
+                        f"train_task/prob_{task}",
+                        probability,
+                        on_step=True,
+                        on_epoch=False,
+                        sync_dist=False,
+                        batch_size=x.shape[0],
+                    )
+            elif mixed_task_ids is not None:
+                for task_index, task in enumerate(TASKS):
+                    task_mask = mixed_task_ids == task_index
+                    task_loss = (losses["loss"] * task_mask).sum() / task_mask.sum().clamp_min(1)
+                    self.log(
+                        f"train_task/{task}_loss",
+                        task_loss,
+                        on_step=True,
+                        on_epoch=True,
+                        sync_dist=True,
+                        batch_size=x.shape[0],
+                    )
+                    probability = self.task_schedule.probabilities_for_step(
+                        int(self.global_step)
+                    )[task_index]
                     self.log(
                         f"train_task/prob_{task}",
                         probability,

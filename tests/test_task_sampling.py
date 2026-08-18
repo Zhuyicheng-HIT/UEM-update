@@ -78,6 +78,39 @@ def test_single_sample_task_conditioning_collates_task_id_cleanly():
     assert conditioned["loss_mask"].shape == (4,)
 
 
+def test_mixed_task_conditioning_builds_masks_per_sample():
+    conditioned = apply_task_conditioning(
+        make_conditioning(), torch.tensor([TASK_TO_ID["recon"], TASK_TO_ID["gen"]]), forecast_prefix=2
+    )
+
+    assert conditioned["task_id"].tolist() == [0, 2]
+    assert not conditioned["traj_mask"][0].bool().any()
+    assert conditioned["traj_mask"][1].bool().all()
+    assert conditioned["valid_frames"][0].tolist() == [1, 1, 1, 0]
+    assert conditioned["valid_frames"][1].bool().all()
+    assert not conditioned["img_mask"][1, 0]
+
+
+def test_mixed_global_512_supercycle_is_exact_and_ddp_sliced():
+    schedule = make_schedule("fixed")
+    expected = [
+        [205, 154, 153],
+        [205, 153, 154],
+        [205, 154, 153],
+        [205, 153, 154],
+        [204, 154, 154],
+    ]
+    totals = torch.zeros(3, dtype=torch.long)
+    for step, expected_counts in enumerate(expected):
+        rank_zero = schedule.task_ids_for_batch(step, 256, rank=0, world_size=2)
+        rank_one = schedule.task_ids_for_batch(step, 256, rank=1, world_size=2)
+        global_ids = torch.cat((rank_zero, rank_one))
+        counts = torch.bincount(global_ids, minlength=3)
+        assert counts.tolist() == expected_counts
+        totals += counts
+    assert totals.tolist() == [1024, 768, 768]
+
+
 def test_fixed_schedule_has_exact_task_budget_and_is_reproducible():
     first = make_schedule("fixed")
     second = make_schedule("fixed")

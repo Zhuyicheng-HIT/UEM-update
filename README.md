@@ -43,9 +43,9 @@ See [DATASET.md](DATASET.md) to download and setup the dataset. This is required
 Set `UEM_DATA_DIR` to the extracted `ee4d_motion_uniegomotion` directory, or place it at
 `data/ee4d_motion_uniegomotion`.
 
-## Flow Matching Experiments (E1–E12)
+## Flow Matching Experiments (E1–E20)
 
-The Flow Matching implementation, B0/E1–E12 configurations, launch/evaluation scripts, and
+The Flow Matching implementation, B0/E1–E20 configurations, launch/evaluation scripts, and
 reproducibility notes are documented in [ablation/README.md](ablation/README.md). The 256-sample
 ablation results and inference benchmark are reported in [result.md](result.md). Generated
 checkpoints, predictions, dataset files, and SMPL-X model files are intentionally not versioned.

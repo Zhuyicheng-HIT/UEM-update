@@ -169,6 +169,12 @@ class UniEgoMotion(nn.Module):
         self.finetune_type = cfg.MODEL.FINETUNE_TYPE
         self.output_branch_mode = str(getattr(cfg.MODEL, "OUTPUT_BRANCH_MODE", "single")).lower()
         self.cond_task = bool(getattr(cfg.MODEL, "COND_TASK", False))
+        self.task_film_enabled = bool(getattr(cfg.MODEL.TASK_FILM, "ENABLED", False))
+        self.num_tasks = int(getattr(cfg.MODEL, "NUM_TASKS", 3))
+        if self.task_film_enabled and not self.cond_task:
+            raise ValueError("MODEL.TASK_FILM.ENABLED requires MODEL.COND_TASK=True.")
+        if self.task_film_enabled and self.encoder_tsfm is not None:
+            raise ValueError("TaskFiLM is defined for the UniEgoMotion decoder, not ENCODER_TSFM.")
 
         self.generative_type = str(getattr(cfg.MODEL, "GENERATIVE_TYPE", "diffusion")).lower()
         flow_types = {"flow", "flow_matching", "flow-matching"}
@@ -219,12 +225,11 @@ class UniEgoMotion(nn.Module):
         self.embed_text_cond = nn.Linear(768, self.latent_dim)  # Not used
         self.embed_text_cond.requires_grad_(False)
         if self.cond_task:
-            num_tasks = int(getattr(cfg.MODEL, "NUM_TASKS", 3))
-            if num_tasks != 3:
+            if self.num_tasks != 3:
                 raise ValueError(
                     "Explicit task conditioning uses the fixed recon/fore/gen mapping and requires NUM_TASKS=3."
                 )
-            self.embed_task_cond = nn.Embedding(num_tasks, self.latent_dim)
+            self.embed_task_cond = nn.Embedding(self.num_tasks, self.latent_dim)
             logger.warning("Using explicit recon/fore/gen task embeddings.")
 
         if self.cond_betas:
@@ -263,8 +268,20 @@ class UniEgoMotion(nn.Module):
             )
         else:
             self.tsfm = nn.ModuleList(
-                [DecoderBlock(self.latent_dim, self.num_heads, self.dropout, 2) for _ in range(self.num_layers)]
+                [
+                    DecoderBlock(
+                        self.latent_dim,
+                        self.num_heads,
+                        self.dropout,
+                        2,
+                        task_film=self.task_film_enabled,
+                        num_tasks=self.num_tasks,
+                    )
+                    for _ in range(self.num_layers)
+                ]
             )
+            if self.task_film_enabled:
+                logger.warning("Using identity-initialized TaskFiLM in all decoder sublayers.")
 
         if self.output_branch_mode == "single":
             self.output_process = nn.Linear(self.latent_dim, self.input_feats)
@@ -299,6 +316,10 @@ class UniEgoMotion(nn.Module):
         if self.global_local_output is None:
             return {}
         return self.global_local_output.fusion_gate_values()
+
+    def task_film_magnitude(self):
+        values = [block.task_film.abs().mean() for block in self.tsfm if block.task_film is not None]
+        return torch.stack(values).mean() if values else None
 
     def mask_cond_finetune(self, cond, cond_type, cond_mask=None):
         # cond: B x T x ... x D
@@ -413,6 +434,7 @@ class UniEgoMotion(nn.Module):
         img_mask = y["img_mask"] if "img_mask" in y else None
 
         enc_time = self.embed_timestep(timesteps)  # B x D
+        task_id = None
         if self.cond_task:
             task_id = y.get("task_id")
             if task_id is None:
@@ -480,7 +502,13 @@ class UniEgoMotion(nn.Module):
                 x = enc(x=x, mask=mask)
         else:
             for dec in self.tsfm:
-                x = dec(x=x, context=context, mask=mask, context_mask=context_mask)
+                x = dec(
+                    x=x,
+                    context=context,
+                    mask=mask,
+                    context_mask=context_mask,
+                    task_id=task_id,
+                )
 
         x = x[:, 1 : 1 + T]
         if self.global_local_output is None:

@@ -157,6 +157,37 @@ def test_split_global_weights_must_be_configured_together():
         raise AssertionError("A partial split-weight configuration should be rejected")
 
 
+def test_task_specific_global_weights_are_applied_per_sample():
+    flow = FlowMatching(
+        prediction_type="x0",
+        global_feature_start=1,
+        global_feature_end=2,
+        task_global_weights=[2.0, 4.0, 8.0],
+    )
+    x_start = torch.zeros(3, 1, 3)
+    prediction = torch.zeros_like(x_start)
+    prediction[..., 1] = 1.0
+
+    class FixedPrediction(nn.Module):
+        def forward(self, x, timestep, **kwargs):
+            del timestep, kwargs
+            return prediction
+
+    terms = flow.training_losses(
+        FixedPrediction(),
+        x_start,
+        model_kwargs={
+            "y": {
+                "valid_frames": torch.ones(3, 1),
+                "task_id": torch.tensor([0, 1, 2]),
+            }
+        },
+        noise=torch.zeros_like(x_start),
+        t=torch.full((3,), 0.5),
+    )
+    torch.testing.assert_close(terms["loss"], torch.tensor([2 / 4, 4 / 6, 8 / 10]))
+
+
 def test_group_mse_diagnostics_are_unweighted_and_keep_the_objective_unchanged():
     feature_dim = 243
     x_start = torch.zeros(1, 1, feature_dim)

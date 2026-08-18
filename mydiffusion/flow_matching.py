@@ -53,6 +53,9 @@ class FlowMatching:
         global_translation_weight: Optional weight for the final three
             dimensions of the 9D global SE(3) delta. When set, the split
             weights override ``global_weight`` inside the global slice.
+        task_global_weights: Optional recon/fore/gen-specific weights for the
+            complete global slice. Requires ``model_kwargs['y']['task_id']``
+            and is mutually exclusive with split global weights.
     """
 
     def __init__(
@@ -68,6 +71,7 @@ class FlowMatching:
         global_feature_end: int = 207,
         global_rotation_weight: Optional[float] = None,
         global_translation_weight: Optional[float] = None,
+        task_global_weights: Optional[Sequence[float]] = None,
     ) -> None:
         if not isinstance(num_steps, int) or num_steps <= 0:
             raise ValueError(f"num_steps must be a positive integer, got {num_steps!r}.")
@@ -104,6 +108,18 @@ class FlowMatching:
                 )
             if any(weight <= 0 for weight in split_weights):
                 raise ValueError("Split global rotation/translation weights must be positive.")
+        if task_global_weights is not None:
+            if global_rotation_weight is not None:
+                raise ValueError(
+                    "task_global_weights cannot be combined with split global rotation/translation weights."
+                )
+            if len(task_global_weights) != 3:
+                raise ValueError(
+                    "task_global_weights must contain recon/fore/gen weights, "
+                    f"got {len(task_global_weights)} values."
+                )
+            if any(float(weight) <= 0 for weight in task_global_weights):
+                raise ValueError("All task-specific global weights must be positive.")
 
         self.num_steps = num_steps
         self.solver = solver.lower()
@@ -119,6 +135,11 @@ class FlowMatching:
         )
         self.global_translation_weight = (
             None if global_translation_weight is None else float(global_translation_weight)
+        )
+        self.task_global_weights = (
+            None
+            if task_global_weights is None
+            else tuple(float(weight) for weight in task_global_weights)
         )
 
     @staticmethod
@@ -260,7 +281,8 @@ class FlowMatching:
         mask = mask.to(dtype=torch.float32)
         loss_weights = mask
         use_split_global_weights = self.global_rotation_weight is not None
-        if self.global_weight != 1.0 or use_split_global_weights:
+        use_task_global_weights = self.task_global_weights is not None
+        if self.global_weight != 1.0 or use_split_global_weights or use_task_global_weights:
             feature_dim = error.shape[-1]
             if self.global_feature_end > feature_dim:
                 raise ValueError(
@@ -268,9 +290,38 @@ class FlowMatching:
                     f"[{self.global_feature_start}, {self.global_feature_end}) exceeds "
                     f"the model feature dimension {feature_dim}."
                 )
-            feature_weights = torch.ones(
-                feature_dim, device=error.device, dtype=torch.float32
-            )
+            if use_task_global_weights:
+                task_id = conditioning.get("task_id")
+                if task_id is None:
+                    raise KeyError(
+                        "Task-specific global weighting requires model_kwargs['y']['task_id']."
+                    )
+                task_id = torch.as_tensor(task_id, device=error.device, dtype=torch.long)
+                if task_id.ndim == 0:
+                    task_id = task_id.expand(error.shape[0])
+                if task_id.shape != (error.shape[0],):
+                    raise ValueError(
+                        f"task_id must have shape ({error.shape[0]},), got {tuple(task_id.shape)}."
+                    )
+                if bool(torch.any((task_id < 0) | (task_id >= len(self.task_global_weights)))):
+                    raise ValueError("task_id values must lie in [0, 2].")
+                configured = torch.tensor(
+                    self.task_global_weights, device=error.device, dtype=torch.float32
+                )
+                global_weights = configured[task_id]
+                feature_weights = torch.ones(
+                    error.shape[0], feature_dim, device=error.device, dtype=torch.float32
+                )
+                feature_weights[
+                    :, self.global_feature_start : self.global_feature_end
+                ] = global_weights[:, None]
+                feature_weights = feature_weights.reshape(
+                    error.shape[0], *((1,) * (error.ndim - 2)), feature_dim
+                )
+            else:
+                feature_weights = torch.ones(
+                    feature_dim, device=error.device, dtype=torch.float32
+                )
             if use_split_global_weights:
                 rotation_end = self.global_feature_start + 6
                 feature_weights[self.global_feature_start : rotation_end] = (
@@ -279,13 +330,14 @@ class FlowMatching:
                 feature_weights[rotation_end : self.global_feature_end] = (
                     self.global_translation_weight
                 )
-            else:
+            elif not use_task_global_weights:
                 feature_weights[
                     self.global_feature_start : self.global_feature_end
                 ] = self.global_weight
-            feature_weights = feature_weights.reshape(
-                *((1,) * (error.ndim - 1)), feature_dim
-            )
+            if not use_task_global_weights:
+                feature_weights = feature_weights.reshape(
+                    *((1,) * (error.ndim - 1)), feature_dim
+                )
             loss_weights = mask * feature_weights
 
         squared_error = error.to(dtype=torch.float32).square() * loss_weights
