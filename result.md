@@ -757,3 +757,79 @@ TensorBoard末次确定性验证flow loss为Recon/Fore/Gen
 - 论文口径指标：`exp/ablation/e{13,14,15,16}_*/metrics_paper_protocol_*euler10.pkl`
 - 论文口径日志：`exp/ablation/e{13,14,15,16}_*/eval_paper_protocol.log`
 - 配对统计：`exp/ablation/e13_e16_paired_bootstrap.json`
+
+## 13. E14任务梯度诊断
+
+### 13.1 实验协议
+
+诊断于2026-08-18完成，使用E14最终 `last.ckpt` 的在线非EMA权重，不创建optimizer、
+不更新参数。固定训练集前20个batch，每批256个原始样本，共5120个样本；同一原始
+batch分别构造成Recon/Fore/Gen，并在三个任务间严格复用相同的Flow timestep、Gaussian
+noise和dropout RNG状态。模型保持train模式并以FP32计算梯度，主结果仅统计共享的
+`87,450,099` 个可训练参数，排除三个互不重叠的task embedding row。
+
+实验按batch分到4张H20并行完成，每卡5个batch。四个分片实际梯度计算均约
+`12.6–13.2 s`，包含数据初始化的总墙钟约2分13秒。
+
+### 13.2 共享参数梯度结果
+
+| 任务对 | 平均余弦 | 中位数 | 范围 | 负余弦比例 |
+|---|---:|---:|---:|---:|
+| Recon–Fore | 0.466 | 0.473 | 0.209–0.645 | 0% |
+| Recon–Gen | 0.410 | 0.395 | 0.258–0.572 | 0% |
+| Fore–Gen | **0.570** | **0.586** | 0.371–0.708 | 0% |
+
+三组任务在20个batch上的共享梯度均保持正相关，没有观察到整体反向冲突。Fore和Gen
+最一致，Recon和Gen差异最大，但最小余弦仍为正值。按E14采样权重构造
+`g_mix = 0.4 g_recon + 0.3 g_fore + 0.3 g_gen` 后，混合梯度抵消率
+`||g_mix|| / sum(w_i ||g_i||)` 平均为 `0.812`，范围为 `0.745–0.870`；即三任务
+存在中等方向差异，但没有严重的破坏性抵消。
+
+| 任务 | 平均梯度范数 | 范数变异系数 | 最大范数 | 超过clip=1.0比例 |
+|---|---:|---:|---:|---:|
+| Recon | 0.111 | 20.6% | 0.159 | 0% |
+| Fore | 0.177 | **35.3%** | **0.320** | 0% |
+| Gen | **0.181** | 26.4% | 0.297 | 0% |
+
+Fore/Gen平均梯度范数分别约为Recon的 `1.59/1.63` 倍。结合 `0.4/0.3/0.3`
+采样权重后，三任务加权范数贡献约为Recon/Fore/Gen
+`29.3%/34.9%/35.8%`：Recon虽然采样概率最高，实际梯度影响反而最小。最终checkpoint
+附近三任务均未触发梯度裁剪，因此当前主要现象是任务间尺度和波动不一致，而不是大梯度
+频繁被clip。
+
+### 13.3 分层与Global/Local诊断
+
+| 参数组 | Recon–Fore | Recon–Gen | Fore–Gen | 混合抵消率 |
+|---|---:|---:|---:|---:|
+| Transformer 0 | 0.198 | 0.173 | 0.460 | 0.745 |
+| Transformer 5 | 0.281 | 0.230 | 0.427 | 0.751 |
+| Transformer 11 | 0.519 | 0.483 | 0.642 | 0.837 |
+| Output Process | **0.675** | **0.642** | **0.793** | **0.895** |
+
+任务差异主要集中在处理条件信息的前中层，越接近输出层，三个任务的梯度越一致。这与
+Recon使用完整条件、Fore/Gen遮挡未来条件的任务定义相符，也说明简单混合不会明显破坏
+输出层，但可能在共享前中层稀释较弱的Recon梯度。
+
+未加权Global MSE中，Recon/Fore/Gen均值分别为 `0.0028/0.0747/0.0852`，Fore/Gen
+约为Recon的 `26.8/30.6` 倍，且二者batch间变异系数达到 `77.9%/79.7%`。相比之下，
+Local MSE均值为 `0.0776/0.1018/0.1122`，波动明显更小。这与E14改善PA-MPJPE、但
+Root和未对齐误差没有同步改善的结果一致：当前更突出的训练难点是Fore/Gen全局运动误差
+的尺度与样本波动。
+
+### 13.4 结论与限制
+
+1. 当前结果不支持“三任务梯度经常反向冲突”；暂时没有使用PCGrad等梯度投影方法的
+   必要。
+2. 单任务batch仍可能产生明显的step间尺度变化，因为Fore/Gen梯度约比Recon大60%，
+   Fore自身的batch间波动也最大。batch内按 `0.4/0.3/0.3` 混合任务具有合理性。
+3. 若设计E17，建议保持global batch 512并按约 `205/154/153` 个Recon/Fore/Gen样本
+   混合，每个样本只构造一个任务，先进行5k–10k step短程对照；同时监控各任务梯度范数，
+   避免Fore/Gen进一步压低Recon的有效贡献。
+4. 本次只诊断最终checkpoint、每个batch只有一组noise/t，且使用训练集前5120个连续
+   样本；没有保存跨batch完整梯度，因而不能直接计算向量方差
+   `E||g-Eg||²`，也不能据此宣称混合batch一定优于当前训练。
+
+诊断结果：
+
+- 冒烟测试：`exp/ablation/e14_explicit_task_token_w8_u84k/gradient_diagnostics/task_gradient_cosine_smoke_b1.json`
+- 20-batch四卡分片：`exp/ablation/e14_explicit_task_token_w8_u84k/gradient_diagnostics/task_gradient_cosine_shard*.json`
