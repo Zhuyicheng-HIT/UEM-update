@@ -21,6 +21,12 @@ _C.DATA.COND_TRAJ = True  # whether to condition on aria trajectory
 _C.DATA.COND_BETAS = False
 _C.DATA.IMG_FEAT_TYPE = "dinov2"  # image feature type if conditioning on image features
 
+_C.SPARSE_JOINTS = CN()
+# Disabled by default so all existing dense configs/checkpoints retain their
+# original 243D v4_beta/v5_beta layout.
+_C.SPARSE_JOINTS.ENABLED = False
+_C.SPARSE_JOINTS.INDICES = [0, 4, 5, 7, 8, 10, 11, 15, 18, 19, 20, 21]
+
 _C.MODEL = CN()
 _C.MODEL.CKPT_PATH = None
 _C.MODEL.PREDICT_XSTART = True
@@ -45,6 +51,25 @@ _C.MODEL.FUSION_STOP_GRAD = True
 # recon=0, fore=1, gen=2 so evaluation and training share checkpoint semantics.
 _C.MODEL.COND_TASK = False
 _C.MODEL.NUM_TASKS = 3
+
+# Optional K12-only Motion Expert.  The default remains the original dense
+# UniEgoMotion backbone so existing experiments/checkpoints are unchanged.
+_C.MODEL.MOTION_EXPERT = CN()
+_C.MODEL.MOTION_EXPERT.ENABLED = False
+# Kept as a compatibility alias for older all-routed experiment YAMLs.
+_C.MODEL.MOTION_EXPERT.NUM_EXPERTS = 12
+_C.MODEL.MOTION_EXPERT.NUM_ROUTED_EXPERTS = 11
+_C.MODEL.MOTION_EXPERT.TOP_K = 2
+_C.MODEL.MOTION_EXPERT.ROUTER_JITTER = 0.0
+_C.MODEL.MOTION_EXPERT.SHARED_EXPERT = True
+_C.MODEL.MOTION_EXPERT.CHUNK_SIZE = 4
+_C.MODEL.MOTION_EXPERT.CONDITIONED_ROUTER = True
+_C.MODEL.MOTION_EXPERT.ROUTED_GATE_INIT = 0.05
+_C.MODEL.MOTION_EXPERT.ROUTED_INIT_NOISE = 0.01
+_C.MODEL.MOTION_EXPERT.INIT_DENSE_CKPT_PATH = None
+_C.MODEL.MOTION_EXPERT.ROUTED_WARMUP_EPOCHS = 10
+_C.MODEL.MOTION_EXPERT.SHARED_UNFREEZE_EPOCH = 30
+_C.MODEL.MOTION_EXPERT.LOAD_BALANCE_WEIGHT = 0.01
 
 _C.FLOW = CN()
 _C.FLOW.NUM_STEPS = 10
@@ -143,6 +168,43 @@ def get_cfg_defaults():
     return _C.clone()
 
 
+def finalize_sparse_joint_config(cfg):
+    """Validate sparse SMPL22 settings and derive the shifted global slice."""
+
+    sparse_cfg = getattr(cfg, "SPARSE_JOINTS", None)
+    if sparse_cfg is None or not sparse_cfg.ENABLED:
+        return cfg
+    if cfg.DATA.REPRE_TYPE not in {"v4_beta", "v5_beta"}:
+        raise ValueError(
+            "SPARSE_JOINTS is supported only for v4_beta or v5_beta motion "
+            f"representations, got {cfg.DATA.REPRE_TYPE!r}."
+        )
+
+    indices = list(sparse_cfg.INDICES)
+    if not indices:
+        raise ValueError("SPARSE_JOINTS.INDICES must contain at least one SMPL22 joint index.")
+    invalid_types = [index for index in indices if isinstance(index, bool) or not isinstance(index, int)]
+    if invalid_types:
+        raise ValueError(f"SPARSE_JOINTS.INDICES must contain integers, got {invalid_types}.")
+    if len(set(indices)) != len(indices):
+        raise ValueError(f"SPARSE_JOINTS.INDICES must be unique, got {indices}.")
+    invalid_indices = [index for index in indices if index < 0 or index >= 22]
+    if invalid_indices:
+        raise ValueError(
+            "SPARSE_JOINTS.INDICES contains indices outside the SMPL22 range "
+            f"[0, 21]: {invalid_indices}."
+        )
+
+    was_frozen = cfg.is_frozen()
+    if was_frozen:
+        cfg.defrost()
+    cfg.FLOW.GLOBAL_FEATURE_START = 9 * len(indices)
+    cfg.FLOW.GLOBAL_FEATURE_END = cfg.FLOW.GLOBAL_FEATURE_START + 9
+    if was_frozen:
+        cfg.freeze()
+    return cfg
+
+
 def get_cfg():
     import sys
     import warnings
@@ -163,6 +225,7 @@ def get_cfg():
         else:
             argv = argv[1:]
         cfg.merge_from_list(argv)
+    finalize_sparse_joint_config(cfg)
     cfg.freeze()
     print(cfg.dump())
     return cfg

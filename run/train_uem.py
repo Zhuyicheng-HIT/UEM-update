@@ -63,9 +63,23 @@ def main():
     # Setup PyTorch Lightning Trainer
     strategy = "auto"
     if cfg.TRAIN.NUM_GPUS > 1:
+        motion_expert_cfg = getattr(cfg.MODEL, "MOTION_EXPERT", None)
+        motion_expert_enabled = bool(
+            motion_expert_cfg is not None and getattr(motion_expert_cfg, "ENABLED", False)
+        )
+        if motion_expert_enabled:
+            # Top-k routing can leave an expert without tokens in a particular
+            # batch.  DDP must therefore allow unused parameters; static graph
+            # mode is incompatible with that dynamic routing pattern.
+            if getattr(cfg.TRAIN, "DDP_STATIC_GRAPH", False):
+                print("MOTION_EXPERT enabled: overriding DDP_STATIC_GRAPH=False for dynamic expert routing.")
         strategy = DDPStrategy(
-            find_unused_parameters=False,
-            static_graph=getattr(cfg.TRAIN, "DDP_STATIC_GRAPH", False),
+            find_unused_parameters=motion_expert_enabled,
+            static_graph=(
+                False
+                if motion_expert_enabled
+                else getattr(cfg.TRAIN, "DDP_STATIC_GRAPH", False)
+            ),
         )
     trainer = pl.Trainer(
         default_root_dir=cfg.TRAIN.EXP_PATH,

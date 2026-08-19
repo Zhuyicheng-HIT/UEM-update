@@ -11,7 +11,15 @@ from loguru import logger
 from torch.utils.data import Dataset, DataLoader
 
 from dataset.canonicalization import get_a_canonicalized_segment
-from dataset.representation_utils import repre_to_full_sequence, saved_sequence_to_repre
+from dataset.representation_utils import (
+    V4_BETA_FEATURES,
+    full_to_sparse_motion,
+    repre_to_full_sequence,
+    saved_sequence_to_repre,
+    sparse_motion_feature_dim,
+    sparse_motion_feature_indices,
+    validate_sparse_body_joint_indices,
+)
 from dataset.smpl_utils import get_smpl, evaluate_smpl
 from utils.vis_utils import save_video, visualize_sequence, visualize_sequence_blender
 from utils.torch_utils import careful_collate_fn
@@ -32,6 +40,7 @@ class EE4D_Motion_Dataset(Dataset):
         window,
         img_feat_type,
         do_normalization=True,
+        sparse_joint_indices=None,
     ):
         super().__init__()
         self.data_dir = data_dir
@@ -42,6 +51,20 @@ class EE4D_Motion_Dataset(Dataset):
         self.img_feat_type = img_feat_type
         self.cond_betas = cond_betas
         self.dataset_name = "ee4d"
+        self.sparse_joint_indices = None
+        if sparse_joint_indices is not None:
+            if self.repre_type not in {"v4_beta", "v5_beta"}:
+                raise ValueError(
+                    "Sparse body-joint prediction supports only v4_beta and v5_beta, "
+                    f"got {self.repre_type!r}."
+                )
+            self.sparse_joint_indices = validate_sparse_body_joint_indices(sparse_joint_indices)
+        self.sparse_joints_enabled = self.sparse_joint_indices is not None
+        self.motion_feature_dim = (
+            sparse_motion_feature_dim(self.sparse_joint_indices)
+            if self.sparse_joints_enabled
+            else {"v1_beta": 234, "v4_beta": 243, "v5_beta": 243}.get(self.repre_type)
+        )
         if self.cond_betas:
             logger.warning("Conditioning on betas.")
         assert self.split in ["train", "val"]
@@ -86,10 +109,19 @@ class EE4D_Motion_Dataset(Dataset):
         if not self.do_normalization:
             return
         logger.warning("Loading stats for the window of 80 frames.")
-        self.stats = torch.load(f"{self.data_dir}/uniegomotion/{self.repre_type}_ee_train_stats.pt", weights_only=False)
+        loaded_stats = torch.load(
+            f"{self.data_dir}/uniegomotion/{self.repre_type}_ee_train_stats.pt", weights_only=False
+        )
         clean_it = lambda x: torch.where(x.abs() < 1e-8, torch.ones_like(x), x)
-        self.stats["traj_std"] = clean_it(self.stats["traj_std"])
-        self.stats["motion_std"] = clean_it(self.stats["motion_std"])
+        loaded_stats["traj_std"] = clean_it(loaded_stats["traj_std"])
+        loaded_stats["motion_std"] = clean_it(loaded_stats["motion_std"])
+        self.full_stats = loaded_stats
+        self.stats = dict(loaded_stats)
+        if self.sparse_joints_enabled:
+            feature_indices = sparse_motion_feature_indices(self.sparse_joint_indices)
+            for key in ("motion_mean", "motion_std", "motion_min", "motion_max"):
+                if key in self.stats:
+                    self.stats[key] = self.stats[key].index_select(0, feature_indices)
 
     def __len__(self):
         return len(self.idx_to_sidx_fidx)
@@ -154,6 +186,9 @@ class EE4D_Motion_Dataset(Dataset):
             self.smpl,
         )
 
+        if self.sparse_joints_enabled:
+            motion = full_to_sparse_motion(motion, self.sparse_joint_indices)
+
         motion = self.normalize(motion, "motion")
         traj = self.normalize(traj, "traj")
         if self.cond_img_feat:
@@ -210,6 +245,12 @@ class EE4D_Motion_Dataset(Dataset):
             traj = ret["pred"]["traj"] if "traj" in ret["pred"] else ret["misc"]["traj"]
             motion = self.denormalize(motion[i][vf], "motion")
             traj = self.denormalize(traj[i][vf], "traj")
+
+            if self.sparse_joints_enabled and motion.shape[-1] != V4_BETA_FEATURES:
+                raise RuntimeError(
+                    "Sparse motion cannot be converted to a full SMPL-X sequence without "
+                    "a sparse-to-full recovery stage. Use sparse-joint metrics instead."
+                )
 
             seq_name = ret["misc"]["seq_name"][i]
 
@@ -282,6 +323,12 @@ class EE4D_Motion_DataModule(pl.LightningDataModule):
             window=self.cfg.DATA.WINDOW,
             img_feat_type=self.cfg.DATA.IMG_FEAT_TYPE,
             cond_betas=self.cfg.DATA.COND_BETAS,
+            sparse_joint_indices=(
+                list(self.cfg.SPARSE_JOINTS.INDICES)
+                if getattr(self.cfg, "SPARSE_JOINTS", None) is not None
+                and self.cfg.SPARSE_JOINTS.ENABLED
+                else None
+            ),
         )
         dataset_name = self.cfg.DATA.DATASET_NAME
         assert dataset_name in ["ee4d"]

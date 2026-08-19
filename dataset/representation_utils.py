@@ -9,6 +9,125 @@ from dataset.egoego_utils import local2global_pose, mat_ik_torch
 from utils.pca_conversions import matrix_to_pca, pca_to_matrix
 
 
+SMPL_BODY_JOINTS = 22
+BODY_JOINT_FEATURES = 9
+FULL_BODY_FEATURES = SMPL_BODY_JOINTS * BODY_JOINT_FEATURES
+V4_BETA_AUX_FEATURES = 45
+V4_BETA_FEATURES = FULL_BODY_FEATURES + V4_BETA_AUX_FEATURES
+
+
+def validate_sparse_body_joint_indices(joint_indices):
+    """Validate and normalize an ordered subset of the SMPL22 body joints."""
+    indices = tuple(int(index) for index in joint_indices)
+    if not indices:
+        raise ValueError("At least one sparse body joint index is required.")
+    if len(set(indices)) != len(indices):
+        raise ValueError(f"Sparse body joint indices must be unique, got {indices}.")
+    invalid = [index for index in indices if index < 0 or index >= SMPL_BODY_JOINTS]
+    if invalid:
+        raise ValueError(
+            f"Sparse body joint indices {invalid} are outside the SMPL22 range "
+            f"[0, {SMPL_BODY_JOINTS - 1}]."
+        )
+    return indices
+
+
+def sparse_motion_feature_dim(joint_indices):
+    """Feature count for K sparse 9D joint blocks plus the unchanged v4_beta auxiliary block."""
+    return len(validate_sparse_body_joint_indices(joint_indices)) * BODY_JOINT_FEATURES + V4_BETA_AUX_FEATURES
+
+
+def sparse_motion_feature_indices(joint_indices, *, device=None):
+    """Indices that gather a full 243D v4_beta vector into sparse-joint order."""
+    joint_indices = validate_sparse_body_joint_indices(joint_indices)
+    feature_indices = []
+    for joint_index in joint_indices:
+        start = joint_index * BODY_JOINT_FEATURES
+        feature_indices.extend(range(start, start + BODY_JOINT_FEATURES))
+    feature_indices.extend(range(FULL_BODY_FEATURES, V4_BETA_FEATURES))
+    return torch.tensor(feature_indices, dtype=torch.long, device=device)
+
+
+def missing_body_joint_indices(joint_indices):
+    """Return SMPL22 joints not present in ``joint_indices``, in canonical order."""
+    observed = set(validate_sparse_body_joint_indices(joint_indices))
+    return tuple(index for index in range(SMPL_BODY_JOINTS) if index not in observed)
+
+
+def full_to_sparse_motion(full_motion, joint_indices):
+    """Gather K body-joint blocks and copy the 45D auxiliary block unchanged.
+
+    ``full_motion`` may have any leading dimensions, but its final dimension
+    must be the 243D ``v4_beta``/``v5_beta`` representation.
+    """
+    if full_motion.shape[-1] != V4_BETA_FEATURES:
+        raise ValueError(
+            f"Expected a {V4_BETA_FEATURES}D full v4_beta motion representation, "
+            f"got shape {tuple(full_motion.shape)}."
+        )
+    indices = sparse_motion_feature_indices(joint_indices, device=full_motion.device)
+    return full_motion.index_select(-1, indices)
+
+
+def extract_missing_body_motion(full_motion, joint_indices):
+    """Gather only the 9D blocks of body joints omitted from a sparse representation."""
+    if full_motion.shape[-1] != V4_BETA_FEATURES:
+        raise ValueError(
+            f"Expected a {V4_BETA_FEATURES}D full v4_beta motion representation, "
+            f"got shape {tuple(full_motion.shape)}."
+        )
+    feature_indices = []
+    for joint_index in missing_body_joint_indices(joint_indices):
+        start = joint_index * BODY_JOINT_FEATURES
+        feature_indices.extend(range(start, start + BODY_JOINT_FEATURES))
+    indices = torch.tensor(feature_indices, dtype=torch.long, device=full_motion.device)
+    return full_motion.index_select(-1, indices)
+
+
+def merge_sparse_and_missing_motion(sparse_motion, missing_motion, joint_indices):
+    """Scatter sparse and recovered missing body blocks into a full 243D vector.
+
+    Observed joint blocks and all auxiliary features are copied directly from
+    ``sparse_motion``.  The mapper therefore cannot alter values produced by
+    the sparse motion model.
+    """
+    joint_indices = validate_sparse_body_joint_indices(joint_indices)
+    missing_indices = missing_body_joint_indices(joint_indices)
+    expected_sparse_dim = sparse_motion_feature_dim(joint_indices)
+    expected_missing_dim = len(missing_indices) * BODY_JOINT_FEATURES
+    if sparse_motion.shape[:-1] != missing_motion.shape[:-1]:
+        raise ValueError(
+            "Sparse and missing motion must have identical leading dimensions, "
+            f"got {tuple(sparse_motion.shape)} and {tuple(missing_motion.shape)}."
+        )
+    if sparse_motion.shape[-1] != expected_sparse_dim:
+        raise ValueError(
+            f"Expected sparse motion dimension {expected_sparse_dim}, got {sparse_motion.shape[-1]}."
+        )
+    if missing_motion.shape[-1] != expected_missing_dim:
+        raise ValueError(
+            f"Expected missing motion dimension {expected_missing_dim}, got {missing_motion.shape[-1]}."
+        )
+
+    full_motion = sparse_motion.new_zeros(*sparse_motion.shape[:-1], V4_BETA_FEATURES)
+    for sparse_offset, joint_index in enumerate(joint_indices):
+        sparse_start = sparse_offset * BODY_JOINT_FEATURES
+        full_start = joint_index * BODY_JOINT_FEATURES
+        full_motion[..., full_start : full_start + BODY_JOINT_FEATURES] = sparse_motion[
+            ..., sparse_start : sparse_start + BODY_JOINT_FEATURES
+        ]
+    for missing_offset, joint_index in enumerate(missing_indices):
+        missing_start = missing_offset * BODY_JOINT_FEATURES
+        full_start = joint_index * BODY_JOINT_FEATURES
+        full_motion[..., full_start : full_start + BODY_JOINT_FEATURES] = missing_motion[
+            ..., missing_start : missing_start + BODY_JOINT_FEATURES
+        ]
+
+    sparse_aux_start = len(joint_indices) * BODY_JOINT_FEATURES
+    full_motion[..., FULL_BODY_FEATURES:] = sparse_motion[..., sparse_aux_start:]
+    return full_motion
+
+
 """
 -----------------------------------------
 Motion representations explanations
@@ -346,7 +465,7 @@ def saved_sequence_to_repre_v4_beta(aria_traj, smpl_params, kp3d, floor_height, 
     # append beta to x
     betas = smpl_params["betas"]  # T x 10
     assert betas.shape[-1] == 10
-    x = torch.cat([x, betas], dim=1)  # T x 234
+    x = torch.cat([x, betas], dim=1)  # T x 243
     return x, aria_traj_repre
 
 

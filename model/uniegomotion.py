@@ -5,7 +5,68 @@ import torch
 import torch.nn as nn
 from model.core import DecoderBlock
 from model.core import EncoderBlock
+from model.core import MoEDecoderBlock
+from model.core import MoEEncoderBlock
 from loguru import logger
+
+
+_MOTION_FEATURE_DIMS = {"v1_beta": 234, "v4_beta": 243, "v5_beta": 243}
+_SPARSE_SUPPORTED_REPRESENTATIONS = {"v4_beta", "v5_beta"}
+_SMPL_BODY_JOINTS = 22
+_JOINT_TRANSFORM_DIM = 9
+_V4_BETA_AUX_DIM = 45
+
+
+def get_sparse_joint_indices(cfg):
+    """Return validated SMPL22 indices, or an empty tuple when disabled."""
+    sparse_cfg = getattr(cfg, "SPARSE_JOINTS", None)
+    if sparse_cfg is None or not bool(getattr(sparse_cfg, "ENABLED", False)):
+        return ()
+
+    indices = tuple(getattr(sparse_cfg, "INDICES", ()))
+    if not indices:
+        raise ValueError("SPARSE_JOINTS.INDICES must contain at least one SMPL22 joint index.")
+    invalid_types = [index for index in indices if isinstance(index, bool) or not isinstance(index, int)]
+    if invalid_types:
+        raise ValueError(f"SPARSE_JOINTS.INDICES must contain integers, got {invalid_types}.")
+    if len(set(indices)) != len(indices):
+        raise ValueError(f"SPARSE_JOINTS.INDICES must be unique, got {list(indices)}.")
+    invalid_indices = [index for index in indices if index < 0 or index >= _SMPL_BODY_JOINTS]
+    if invalid_indices:
+        raise ValueError(
+            "SPARSE_JOINTS.INDICES contains indices outside the SMPL22 range "
+            f"[0, 21]: {invalid_indices}."
+        )
+    return indices
+
+
+def get_motion_feature_dim(cfg):
+    """Resolve the model's motion feature dimension from representation/config."""
+    repre_type = cfg.DATA.REPRE_TYPE
+    if repre_type not in _MOTION_FEATURE_DIMS:
+        raise ValueError(
+            f"Unsupported DATA.REPRE_TYPE {repre_type!r}; expected one of {sorted(_MOTION_FEATURE_DIMS)}."
+        )
+
+    sparse_joint_indices = get_sparse_joint_indices(cfg)
+    if not sparse_joint_indices:
+        return _MOTION_FEATURE_DIMS[repre_type]
+    if repre_type not in _SPARSE_SUPPORTED_REPRESENTATIONS:
+        raise ValueError(
+            "SPARSE_JOINTS is supported only for v4_beta or v5_beta motion "
+            f"representations, got {repre_type!r}."
+        )
+    return _JOINT_TRANSFORM_DIM * len(sparse_joint_indices) + _V4_BETA_AUX_DIM
+
+
+def get_global_feature_slice(cfg):
+    """Return the contiguous 9D global delta slice for dense or sparse motion."""
+
+    sparse_joint_indices = get_sparse_joint_indices(cfg)
+    if sparse_joint_indices:
+        start = _JOINT_TRANSFORM_DIM * len(sparse_joint_indices)
+        return start, start + _JOINT_TRANSFORM_DIM
+    return int(cfg.FLOW.GLOBAL_FEATURE_START), int(cfg.FLOW.GLOBAL_FEATURE_END)
 
 
 def mask_it(mask, cond, replace_token):
@@ -169,6 +230,13 @@ class UniEgoMotion(nn.Module):
         self.finetune_type = cfg.MODEL.FINETUNE_TYPE
         self.output_branch_mode = str(getattr(cfg.MODEL, "OUTPUT_BRANCH_MODE", "single")).lower()
         self.cond_task = bool(getattr(cfg.MODEL, "COND_TASK", False))
+        motion_expert_cfg = getattr(cfg.MODEL, "MOTION_EXPERT", None)
+        self.motion_expert_enabled = bool(
+            motion_expert_cfg is not None and getattr(motion_expert_cfg, "ENABLED", False)
+        )
+        self.motion_expert_cfg = motion_expert_cfg
+        if self.motion_expert_enabled and cfg.MODEL.LEARN_TRAJ:
+            raise ValueError("MOTION_EXPERT is a K12 motion model and cannot be combined with LEARN_TRAJ.")
 
         self.generative_type = str(getattr(cfg.MODEL, "GENERATIVE_TYPE", "diffusion")).lower()
         flow_types = {"flow", "flow_matching", "flow-matching"}
@@ -182,17 +250,50 @@ class UniEgoMotion(nn.Module):
             logger.warning(f"Using finetune type {self.finetune_type}.")
 
         self.repre_type = cfg.DATA.REPRE_TYPE
-        self.input_feats = {"v1_beta": 234, "v4_beta": 243, "v5_beta": 243}[self.repre_type]
+        if self.repre_type not in _MOTION_FEATURE_DIMS:
+            raise ValueError(
+                f"Unsupported DATA.REPRE_TYPE {self.repre_type!r}; "
+                f"expected one of {sorted(_MOTION_FEATURE_DIMS)}."
+            )
         traj_dim = {"v1_beta": 9, "v4_beta": 18, "v5_beta": 18}[self.repre_type]
         self.latent_dim = latent_dim
 
         if cfg.MODEL.LEARN_TRAJ:
             self.input_feats = traj_dim
+            self.sparse_joint_indices = ()
+            self.global_feature_start = int(cfg.FLOW.GLOBAL_FEATURE_START)
+            self.global_feature_end = int(cfg.FLOW.GLOBAL_FEATURE_END)
             logger.warning("LEARNING TRAJ... USING SMALLER MODEL.")
             latent_dim = 512
             ff_size = 512 * 2
             num_layers = 8
             num_heads = 8
+        else:
+            self.input_feats = get_motion_feature_dim(cfg)
+            self.sparse_joint_indices = get_sparse_joint_indices(cfg)
+            self.global_feature_start, self.global_feature_end = get_global_feature_slice(cfg)
+            if self.sparse_joint_indices:
+                logger.warning(
+                    "Using sparse SMPL22 body features: "
+                    f"indices={list(self.sparse_joint_indices)}, input_feats={self.input_feats}, "
+                    f"global=[{self.global_feature_start}, {self.global_feature_end})."
+                )
+
+        if self.motion_expert_enabled:
+            # The 400M expert is deliberately scoped to the K12 experiment.
+            # Keeping this restriction explicit prevents accidentally comparing
+            # differently parameterized dense/K3/K6/K10 models under one name.
+            if len(self.sparse_joint_indices) != 12 or self.input_feats != 153:
+                raise ValueError(
+                    "MOTION_EXPERT currently requires the K12 sparse v4_beta layout "
+                    "(12 joints and 153 motion features)."
+                )
+            logger.warning(
+                "Using the 400M K12 Motion Expert: "
+                f"{getattr(motion_expert_cfg, 'NUM_ROUTED_EXPERTS', 11)} routed experts, "
+                f"top-{motion_expert_cfg.TOP_K} routing, "
+                f"chunk={getattr(motion_expert_cfg, 'CHUNK_SIZE', 4)}."
+            )
 
         self.ff_size = ff_size
         self.num_layers = num_layers
@@ -255,15 +356,40 @@ class UniEgoMotion(nn.Module):
         # unused text condition parameters from DDP gradient synchronization.
         self.mask_tokens["text"].requires_grad_(False)
 
+        self._last_moe_aux_loss = None
         if self.encoder_tsfm is not None:
             assert self.encoder_tsfm in ["add"]
             logger.warning("Using encoder.")
+            block_cls = MoEEncoderBlock if self.motion_expert_enabled else EncoderBlock
+            block_kwargs = {}
+            if self.motion_expert_enabled:
+                block_kwargs = {
+                    "num_experts": int(getattr(motion_expert_cfg, "NUM_ROUTED_EXPERTS", 11)),
+                    "top_k": int(motion_expert_cfg.TOP_K),
+                    "router_jitter": float(getattr(motion_expert_cfg, "ROUTER_JITTER", 0.0)),
+                    "shared_expert": bool(getattr(motion_expert_cfg, "SHARED_EXPERT", True)),
+                    "chunk_size": int(getattr(motion_expert_cfg, "CHUNK_SIZE", 4)),
+                    "router_conditioned": bool(getattr(motion_expert_cfg, "CONDITIONED_ROUTER", True)),
+                    "routed_gate_init": float(getattr(motion_expert_cfg, "ROUTED_GATE_INIT", 0.05)),
+                }
             self.tsfm = nn.ModuleList(
-                [EncoderBlock(self.latent_dim, self.num_heads, self.dropout, 2) for _ in range(self.num_layers)]
+                [block_cls(self.latent_dim, self.num_heads, self.dropout, 2, **block_kwargs) for _ in range(self.num_layers)]
             )
         else:
+            block_cls = MoEDecoderBlock if self.motion_expert_enabled else DecoderBlock
+            block_kwargs = {}
+            if self.motion_expert_enabled:
+                block_kwargs = {
+                    "num_experts": int(getattr(motion_expert_cfg, "NUM_ROUTED_EXPERTS", 11)),
+                    "top_k": int(motion_expert_cfg.TOP_K),
+                    "router_jitter": float(getattr(motion_expert_cfg, "ROUTER_JITTER", 0.0)),
+                    "shared_expert": bool(getattr(motion_expert_cfg, "SHARED_EXPERT", True)),
+                    "chunk_size": int(getattr(motion_expert_cfg, "CHUNK_SIZE", 4)),
+                    "router_conditioned": bool(getattr(motion_expert_cfg, "CONDITIONED_ROUTER", True)),
+                    "routed_gate_init": float(getattr(motion_expert_cfg, "ROUTED_GATE_INIT", 0.05)),
+                }
             self.tsfm = nn.ModuleList(
-                [DecoderBlock(self.latent_dim, self.num_heads, self.dropout, 2) for _ in range(self.num_layers)]
+                [block_cls(self.latent_dim, self.num_heads, self.dropout, 2, **block_kwargs) for _ in range(self.num_layers)]
             )
 
         if self.output_branch_mode == "single":
@@ -272,17 +398,17 @@ class UniEgoMotion(nn.Module):
         else:
             if cfg.MODEL.LEARN_TRAJ:
                 raise ValueError("Global/local output branches are not supported with MODEL.LEARN_TRAJ.")
-            if self.repre_type not in {"v4_beta", "v5_beta"} or self.input_feats != 243:
+            if self.repre_type not in _SPARSE_SUPPORTED_REPRESENTATIONS:
                 raise ValueError(
-                    "Global/local output branches require the 243D v4_beta or v5_beta representation, "
+                    "Global/local output branches require the v4_beta or v5_beta representation, "
                     f"got {self.repre_type!r} with {self.input_feats} features."
                 )
             self.output_process = None
             self.global_local_output = GlobalLocalOutputHead(
                 latent_dim=self.latent_dim,
                 output_dim=self.input_feats,
-                global_start=cfg.FLOW.GLOBAL_FEATURE_START,
-                global_end=cfg.FLOW.GLOBAL_FEATURE_END,
+                global_start=self.global_feature_start,
+                global_end=self.global_feature_end,
                 mode=self.output_branch_mode,
                 dropout=self.dropout,
                 gate_init=getattr(cfg.MODEL, "FUSION_GATE_INIT", -4.0),
@@ -291,7 +417,7 @@ class UniEgoMotion(nn.Module):
             logger.warning(
                 "Using Global/Local output branches: "
                 f"mode={self.output_branch_mode}, "
-                f"global=[{cfg.FLOW.GLOBAL_FEATURE_START}, {cfg.FLOW.GLOBAL_FEATURE_END}), "
+                f"global=[{self.global_feature_start}, {self.global_feature_end}), "
                 f"stop_gradient={getattr(cfg.MODEL, 'FUSION_STOP_GRAD', True)}."
             )
 
@@ -299,6 +425,42 @@ class UniEgoMotion(nn.Module):
         if self.global_local_output is None:
             return {}
         return self.global_local_output.fusion_gate_values()
+
+    def get_moe_auxiliary_loss(self):
+        """Return the mean router load-balancing loss from the latest forward."""
+        if not self.motion_expert_enabled or self._last_moe_aux_loss is None:
+            return None
+        return self._last_moe_aux_loss
+
+    def initialize_motion_expert_from_dense(self, dense_state, noise_std=0.01):
+        """Initialize the new MoE from a dense K12 model state.
+
+        Attention/condition/output weights keep their exact names.  Dense FFN
+        parameters are copied into each layer's independent Shared Expert;
+        routed experts are then cloned from that shared branch with a small
+        perturbation.  The method returns the number of copied tensors.
+        """
+        if not self.motion_expert_enabled:
+            return 0
+        own_state = self.state_dict()
+        copied = 0
+        with torch.no_grad():
+            for key, target in own_state.items():
+                if key.startswith("tsfm.") and ".ff.shared." in key:
+                    dense_key = key.replace(".ff.shared.", ".ff.", 1)
+                else:
+                    dense_key = key
+                source = dense_state.get(dense_key)
+                if source is None or tuple(source.shape) != tuple(target.shape):
+                    continue
+                target.copy_(source.to(device=target.device, dtype=target.dtype))
+                copied += 1
+
+            for block in self.tsfm:
+                if hasattr(block.ff, "initialize_routed_from_shared"):
+                    block.ff.initialize_routed_from_shared(noise_std=noise_std)
+        logger.warning(f"Initialized Motion Expert from dense K12 state: copied {copied} tensors.")
+        return copied
 
     def mask_cond_finetune(self, cond, cond_type, cond_mask=None):
         # cond: B x T x ... x D
@@ -386,24 +548,29 @@ class UniEgoMotion(nn.Module):
         else:
             raise ValueError(f"img_feat_type is {self.img_feat_type}")
 
-    def forward(self, x, timesteps, y, cond_scale=None, diffusion=None):
+    def forward(self, x, timesteps, y, cond_scale=None, diffusion=None, return_hidden=False):
         """
         x_t: B x T x F
         timesteps: B
         y: dict
         """
         if cond_scale is not None:
-            x_cond = self.forward(x, timesteps, y)  # conditional output
+            x_cond = self.forward(x, timesteps, y, return_hidden=return_hidden)  # conditional output
             uncond_y = {"valid_frames": y["valid_frames"]}
             if "task_id" in y:
                 # Task identity is an instruction, not a modality to drop for CFG.
                 uncond_y["task_id"] = y["task_id"]
-            x_uncond = self.forward(x, timesteps, uncond_y)  # unconditional output
+            x_uncond = self.forward(x, timesteps, uncond_y, return_hidden=return_hidden)  # unconditional output
 
             # Both predicted x_start (diffusion) and velocity (flow matching)
             # support classifier-free guidance by linear output interpolation.
-            x_scaled = x_uncond + (x_cond - x_uncond) * cond_scale
-            return x_scaled
+            if return_hidden:
+                x_cond, h_cond = x_cond
+                x_uncond, h_uncond = x_uncond
+                x_scaled = x_uncond + (x_cond - x_uncond) * cond_scale
+                h_scaled = h_uncond + (h_cond - h_uncond) * cond_scale
+                return x_scaled, h_scaled
+            return x_uncond + (x_cond - x_uncond) * cond_scale
 
         B, T, F = x.shape
         x = self.input_process(x)  # B x T x D
@@ -426,6 +593,7 @@ class UniEgoMotion(nn.Module):
                     raise ValueError(f"task_id must have shape ({B},), got {tuple(task_id.shape)}.")
             enc_time = enc_time + self.embed_task_cond(task_id)
 
+        pose_router_cond = x
         if "traj" in y:  # B x T x F
             enc_traj = self.embed_traj_cond(y["traj"])  # B x T x D
             enc_traj = self.mask_cond(enc_traj, "traj", traj_mask)
@@ -447,6 +615,12 @@ class UniEgoMotion(nn.Module):
 
             enc_img_mask = y["valid_img_embs"]  # B x C
 
+            # Keep a frame-aligned egovideo condition for the chunk router
+            # before flattening DINO register tokens into the attention context.
+            router_ego_cond = enc_imgs.mean(dim=2) if enc_imgs.ndim == 4 else enc_imgs
+            if router_ego_cond.shape[1] != T:
+                router_ego_cond = router_ego_cond.mean(dim=1, keepdim=True).expand(-1, T, -1)
+
             if self.img_feat_type == "dinov2_reg":
                 enc_imgs = enc_imgs.flatten(1, 2)  # B x T x 5 x D to B x T5 x D
                 enc_img_mask = enc_img_mask[:, :, None].repeat(1, 1, 5).flatten(1, 2)  # B x T to B x T5
@@ -457,6 +631,7 @@ class UniEgoMotion(nn.Module):
             enc_imgs = self.mask_tokens["clip"].view(1, 1, -1).repeat(B, T, 1)
             enc_imgs = self.pos_enc_and_process_img_feat(x, enc_imgs)
             enc_img_mask = y["valid_frames"]
+            router_ego_cond = enc_imgs
 
             all_cond.append(enc_imgs)
             all_cond_mask.append(enc_img_mask)
@@ -470,6 +645,15 @@ class UniEgoMotion(nn.Module):
         context_mask = context_mask[:, None, None, :]  # B x 1 x 1 x C
         context = torch.cat(all_cond, dim=1)  # B x C x D
 
+        router_conditions = None
+        if self.motion_expert_enabled:
+            router_conditions = {
+                "pose": pose_router_cond,
+                "ego": router_ego_cond,
+                "timestep": enc_time,
+                "valid_frames": y["valid_frames"].bool(),
+            }
+
         if self.encoder_tsfm:
             if self.encoder_tsfm == "add":
                 x = x + context
@@ -477,12 +661,27 @@ class UniEgoMotion(nn.Module):
                 raise ValueError(f"encoder_tsfm is {self.encoder_tsfm}")
 
             for enc in self.tsfm:
-                x = enc(x=x, mask=mask)
+                x = enc(x=x, mask=mask, router_conditions=router_conditions)
         else:
             for dec in self.tsfm:
-                x = dec(x=x, context=context, mask=mask, context_mask=context_mask)
+                x = dec(
+                    x=x,
+                    context=context,
+                    mask=mask,
+                    context_mask=context_mask,
+                    router_conditions=router_conditions,
+                )
 
-        x = x[:, 1 : 1 + T]
+        if self.motion_expert_enabled:
+            aux_losses = [
+                block.ff.last_aux_loss
+                for block in self.tsfm
+                if hasattr(block.ff, "last_aux_loss") and block.ff.last_aux_loss is not None
+            ]
+            self._last_moe_aux_loss = torch.stack(aux_losses).mean() if aux_losses else None
+
+        hidden = x[:, 1 : 1 + T].contiguous()
+        x = hidden
         if self.global_local_output is None:
             x = self.output_process(x)  # B x T x (J x F)
         else:
@@ -500,6 +699,8 @@ class UniEgoMotion(nn.Module):
             repaint_value = y["repaint_value"]
             x = x * (1 - repaint_mask) + repaint_mask * repaint_value
 
+        if return_hidden:
+            return x, hidden
         return x
 
 

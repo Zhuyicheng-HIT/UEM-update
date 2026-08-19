@@ -47,6 +47,8 @@ class UEM_Module(pl.LightningModule):
         else:
             raise ValueError(f"Unknown model name {self.model_name}")
 
+        self._initialize_motion_expert()
+
         if self.is_lstm:
             if self.task_sampler_enabled:
                 raise ValueError("Explicit E13--E16 task sampling is currently supported only by the flow UEM model.")
@@ -91,6 +93,65 @@ class UEM_Module(pl.LightningModule):
             )
         self.last_iters = []
 
+    def _initialize_motion_expert(self):
+        """Load dense K12 weights into Shared Experts before DDP wrapping."""
+        expert_cfg = getattr(self.cfg.MODEL, "MOTION_EXPERT", None)
+        if self.is_lstm or expert_cfg is None or not bool(getattr(expert_cfg, "ENABLED", False)):
+            return
+        init_path = getattr(expert_cfg, "INIT_DENSE_CKPT_PATH", None)
+        if not init_path:
+            logger.warning("Motion Expert has no INIT_DENSE_CKPT_PATH; using random shared/routed weights.")
+            return
+        if not os.path.isfile(init_path):
+            raise FileNotFoundError(
+                f"Motion Expert dense initialization state does not exist: {init_path}. "
+                "Create it from the existing K12 checkpoint before training."
+            )
+        logger.warning(f"Loading dense K12 initialization state from {init_path}")
+        state = torch.load(init_path, map_location="cpu", weights_only=True)
+        if "state_dict" in state:
+            state = state["state_dict"]
+        # Accept either a raw model state or a Lightning state with model.* keys.
+        dense_state = {}
+        for key, value in state.items():
+            dense_state[key[6:] if key.startswith("model.") else key] = value
+        copied = self.model.initialize_motion_expert_from_dense(
+            dense_state,
+            noise_std=float(getattr(expert_cfg, "ROUTED_INIT_NOISE", 0.01)),
+        )
+        if copied == 0:
+            raise RuntimeError("Dense initialization state did not match any Motion Expert tensors.")
+
+    def _set_motion_expert_train_phase(self, epoch):
+        """Progressively expose routed, shared and backbone parameters."""
+        expert_cfg = getattr(self.cfg.MODEL, "MOTION_EXPERT", None)
+        if self.is_lstm or expert_cfg is None or not bool(getattr(expert_cfg, "ENABLED", False)):
+            return
+        warmup_epochs = int(getattr(expert_cfg, "ROUTED_WARMUP_EPOCHS", 10))
+        shared_epoch = int(getattr(expert_cfg, "SHARED_UNFREEZE_EPOCH", 30))
+        for name, parameter in self.model.named_parameters():
+            if ".ff." not in name:
+                # Keep the original input/attention/condition backbone frozen
+                # until the routed branch has learned a useful partition.
+                parameter.requires_grad = epoch >= shared_epoch
+                continue
+            is_router_or_routed = ".ff.router" in name or ".ff.routed_experts." in name or ".ff.routed_gate" in name
+            is_shared = ".ff.shared." in name
+            if is_router_or_routed:
+                parameter.requires_grad = True
+            elif is_shared:
+                parameter.requires_grad = epoch >= shared_epoch
+            else:
+                parameter.requires_grad = epoch >= shared_epoch
+        if epoch == 0:
+            logger.warning(
+                "Motion Expert curriculum: routed experts/router train first; "
+                f"shared/backbone unfreeze at epoch {shared_epoch}."
+            )
+
+    def on_train_epoch_start(self):
+        self._set_motion_expert_train_phase(int(self.current_epoch))
+
     def _batch_for_task(self, batch, task):
         conditioned_batch = dict(batch)
         conditioned_batch["y"] = apply_task_conditioning(
@@ -134,7 +195,29 @@ class UEM_Module(pl.LightningModule):
             }
         ]
 
+    def _add_motion_expert_auxiliary_loss(self, loss, mode):
+        """Add router load-balancing regularization for the optional MoE expert."""
+        if not hasattr(self.model, "get_moe_auxiliary_loss"):
+            return loss
+        aux_loss = self.model.get_moe_auxiliary_loss()
+        if aux_loss is None:
+            return loss
+        expert_cfg = getattr(self.cfg.MODEL, "MOTION_EXPERT", None)
+        aux_weight = float(getattr(expert_cfg, "LOAD_BALANCE_WEIGHT", 0.0))
+        if aux_weight <= 0:
+            return loss
+        self.log(
+            f"{mode}/moe_aux_loss",
+            aux_loss,
+            on_step=mode == "train",
+            on_epoch=True,
+            sync_dist=True,
+            batch_size=self.cfg.DATA.BATCH_SIZE,
+        )
+        return loss + aux_weight * aux_loss
+
     def on_train_start(self):
+        self._set_motion_expert_train_phase(int(self.current_epoch))
         if self.cfg.MODEL.CKPT_PATH is None:
             return
         if self.cfg.TRAIN.USE_CKPT_LR:
@@ -179,6 +262,7 @@ class UEM_Module(pl.LightningModule):
         if self.generative_type in {"flow", "flow_matching"}:
             losses = self.flow.training_losses(self.model, x, model_kwargs={"y": batch["y"]})
             loss = losses["loss"].mean()
+            loss = self._add_motion_expert_auxiliary_loss(loss, mode)
             self.log(
                 f"{mode}/loss",
                 loss,
@@ -234,6 +318,7 @@ class UEM_Module(pl.LightningModule):
             self.schedule_sampler.update_with_local_losses(t, losses["loss"].detach())
 
         loss = (losses["loss"] * weights).mean()
+        loss = self._add_motion_expert_auxiliary_loss(loss, mode)
 
         # To monitor diffusion step wise loss
         assert losses["loss"].shape[0] == x.shape[0]
@@ -345,7 +430,7 @@ class UEM_Module(pl.LightningModule):
         if self.task_schedule is not None and "explicit_task_schedule" in checkpoint:
             self.task_schedule.load_state_dict(checkpoint["explicit_task_schedule"])
 
-    def sample(self, y, B=1, cond_scale=None, return_all_pred_xstart=False):
+    def sample(self, y, B=1, cond_scale=None, return_all_pred_xstart=False, return_one_step_hidden=False):
         if self.is_lstm:
             x = torch.zeros(B, self.window, self.model.input_feats, device=self.device)
             x = self.model(x, y)
@@ -362,7 +447,11 @@ class UEM_Module(pl.LightningModule):
                 noise=None,
                 progress=False,
                 return_all_pred_xstart=return_all_pred_xstart,
+                return_one_step_hidden=return_one_step_hidden,
             )
+
+        if return_one_step_hidden:
+            raise ValueError("one-step hidden export is only implemented for Flow Matching models.")
 
         x = self.diffusion.p_sample_loop(
             self.model,

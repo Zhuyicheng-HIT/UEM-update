@@ -199,9 +199,14 @@ class FlowMatching:
         x_t: Tensor,
         t: Tensor,
         model_kwargs: Mapping[str, Any],
+        return_hidden: bool = False,
     ) -> Tuple[Tensor, Tensor]:
         """Return ``(velocity, clean_prediction)`` for either parameterization."""
-        model_output = model(x_t, t, **model_kwargs)
+        if return_hidden:
+            model_output, hidden = model(x_t, t, return_hidden=True, **model_kwargs)
+        else:
+            model_output = model(x_t, t, **model_kwargs)
+            hidden = None
         if model_output.shape != x_t.shape:
             raise ValueError(
                 f"The model must output shape {tuple(x_t.shape)}, got "
@@ -213,6 +218,8 @@ class FlowMatching:
         else:
             pred_xstart = model_output
             velocity = self.target_to_velocity(x_t, t, pred_xstart)
+        if return_hidden:
+            return velocity, pred_xstart, hidden
         return velocity, pred_xstart
 
     def _valid_frame_mse(
@@ -424,6 +431,7 @@ class FlowMatching:
         solver: Optional[str] = None,
         device: Optional[Union[str, torch.device]] = None,
         progress: bool = False,
+        return_one_step_hidden: bool = False,
     ) -> Iterator[Dict[str, Tensor]]:
         """Integrate from Gaussian noise at ``t=1`` to data at ``t=0``."""
         model_kwargs = {} if model_kwargs is None else model_kwargs
@@ -458,7 +466,18 @@ class FlowMatching:
         for index in indices:
             t_scalar, next_t_scalar = times[index], times[index + 1]
             t = t_scalar.expand(batch_size)
-            velocity, pred_xstart = self._model_prediction(model, x, t, model_kwargs)
+            prediction = self._model_prediction(
+                model,
+                x,
+                t,
+                model_kwargs,
+                return_hidden=return_one_step_hidden,
+            )
+            if return_one_step_hidden:
+                velocity, pred_xstart, hidden = prediction
+            else:
+                velocity, pred_xstart = prediction
+                hidden = None
             dt = (next_t_scalar - t_scalar).to(dtype=x.dtype)
 
             if chosen_solver == "euler":
@@ -480,12 +499,15 @@ class FlowMatching:
                     )
                     next_x = x + 0.5 * dt * (velocity + next_velocity)
 
-            yield {
+            output = {
                 "sample": next_x,
                 "pred_xstart": pred_xstart,
                 "t": t,
                 "next_t": next_t_scalar.expand(batch_size),
             }
+            if return_one_step_hidden:
+                output["one_step_hidden"] = hidden
+            yield output
             x = next_x
 
     @torch.no_grad()
@@ -500,10 +522,12 @@ class FlowMatching:
         device: Optional[Union[str, torch.device]] = None,
         progress: bool = False,
         return_all_pred_xstart: bool = False,
+        return_one_step_hidden: bool = False,
     ) -> Union[Tensor, Tuple[Tensor, list[Tensor]]]:
         """Sample a batch and optionally return one clean estimate per step."""
         final: Optional[Dict[str, Tensor]] = None
         all_pred_xstart = []
+        one_step_hidden = None
         for output in self.sample_loop_progressive(
             model=model,
             shape=shape,
@@ -513,13 +537,20 @@ class FlowMatching:
             solver=solver,
             device=device,
             progress=progress,
+            return_one_step_hidden=return_one_step_hidden,
         ):
             final = output
+            if return_one_step_hidden and one_step_hidden is None:
+                one_step_hidden = output.get("one_step_hidden")
             if return_all_pred_xstart:
                 all_pred_xstart.append(output["pred_xstart"])
 
         # num_steps is validated as positive by sample_loop_progressive.
         assert final is not None
+        if return_one_step_hidden:
+            if return_all_pred_xstart:
+                return final["sample"], all_pred_xstart, one_step_hidden
+            return final["sample"], one_step_hidden
         if return_all_pred_xstart:
             return final["sample"], all_pred_xstart
         return final["sample"]

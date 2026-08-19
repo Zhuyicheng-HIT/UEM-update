@@ -1,0 +1,87 @@
+# K12 400M Motion Expert: per-layer Shared Global Expert + 11 Routed Experts.
+# Routing is conditioned on motion/pose/egovideo/timestep and shared by every
+# four-frame temporal chunk.  The full ten-step Flow Matching sampler remains.
+DATA:
+  DATASET_NAME: ee4d
+  REPRE_TYPE: v4_beta
+  COND_BETAS: False
+  COND_IMG_FEAT: True
+  COND_TRAJ: True
+  WINDOW: 80
+  IMG_FEAT_TYPE: dinov2
+  BATCH_SIZE: 16
+  NUM_WORKERS: 8
+  PIN_MEMORY: True
+  PERSISTENT_WORKERS: True
+  PREFETCH_FACTOR: 2
+  DROP_LAST: True
+
+SPARSE_JOINTS:
+  ENABLED: True
+  INDICES: [0, 4, 5, 10, 11, 13, 14, 15, 18, 19, 20, 21]
+
+MODEL:
+  MODEL_NAME: uem
+  GENERATIVE_TYPE: flow
+  CKPT_PATH: null
+  MOTION_EXPERT:
+    ENABLED: True
+    NUM_EXPERTS: 12  # compatibility alias; the active routed count is 11.
+    NUM_ROUTED_EXPERTS: 11
+    TOP_K: 2
+    ROUTER_JITTER: 0.0
+    SHARED_EXPERT: True
+    CHUNK_SIZE: 4
+    CONDITIONED_ROUTER: True
+    ROUTED_GATE_INIT: 0.05
+    ROUTED_INIT_NOISE: 0.01
+    INIT_DENSE_CKPT_PATH: exp/smpl_ablation/k12_e7_x0_global_w8_u84k/dense_model_state.pt
+    ROUTED_WARMUP_EPOCHS: 10
+    SHARED_UNFREEZE_EPOCH: 30
+    LOAD_BALANCE_WEIGHT: 0.01
+
+FLOW:
+  NUM_STEPS: 10
+  SOLVER: euler
+  BETA_ALPHA: 1.5
+  BETA_BETA: 1.0
+  T_MIN: 0.001
+  PREDICTION_TYPE: x0
+  GLOBAL_WEIGHT: 8.0
+  GLOBAL_FEATURE_START: 108
+  GLOBAL_FEATURE_END: 117
+
+TRAIN:
+  EXP_PATH: exp/smpl_ablation/k12_e7_x0_global_w8_u84k_400m_shared_chunk4
+  USE_CKPT_LR: False
+  WEIGHT_DECAY: 0.01
+  LR: 3.0e-5
+  NUM_EPOCHS: 300
+  NUM_GPUS: 8
+  PRECISION: bf16-mixed
+  ACCUMULATE_GRAD_BATCHES: 4
+  GRADIENT_CLIP_VAL: 1.0
+  DDP_STATIC_GRAPH: False
+  CUDNN_BENCHMARK: True
+  FUSED_ADAMW: False
+  EMA_DECAY: 0.992028
+  SCHEDULER: cosine_warmup
+  WARMUP_EPOCHS: 10
+  SCHEDULER_TOTAL_EPOCHS: 300
+  MIN_LR_RATIO: 0.1
+  NUM_SANITY_VAL_STEPS: 0
+  LOG_EVERY_N_STEPS: 10
+  PROGRESS_REFRESH_RATE: 10
+  CHECK_VAL_EVERY_N_EPOCHS: 5
+  SAVE_EVERY_N_EPOCHS: 10
+  EARLY_STOP_PATIENCE: 0
+  EARLY_STOP_MIN_DELTA: 1.0e-4
+  EVAL_SUFFIX: _smpl_k12_e7_x0_global_w8_400m_shared_chunk4_euler10
+
+EVAL:
+  KEY_JOINTS_ONLY: True
+  KEY_JOINT_INDICES: [0, 4, 5, 10, 11, 13, 14, 15, 18, 19, 20, 21]
+  RUN_SEMANTIC: False
+  NUM_GPUS: 1
+  NUM_SAMPLES: 256
+  BATCH_SIZE: 16

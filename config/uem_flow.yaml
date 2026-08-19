@@ -13,6 +13,11 @@ DATA:
   PREFETCH_FACTOR: 2
   DROP_LAST: True
 
+SPARSE_JOINTS:
+  ENABLED: True
+  # pelvis, knees, ankles, feet, head, elbows, and wrists in SMPL22 order
+  INDICES: [0, 4, 5, 7, 8, 10, 11, 15, 18, 19, 20, 21]
+
 MODEL:
   MODEL_NAME: uem
   GENERATIVE_TYPE: flow
@@ -25,8 +30,10 @@ FLOW:
   T_MIN: 0.001
   PREDICTION_TYPE: velocity
   GLOBAL_WEIGHT: 1.0
-  GLOBAL_FEATURE_START: 198
-  GLOBAL_FEATURE_END: 207
+  # Derived from 9 * len(SPARSE_JOINTS.INDICES); get_cfg updates these
+  # automatically when the joint set is overridden from the command line.
+  GLOBAL_FEATURE_START: 108
+  GLOBAL_FEATURE_END: 117
 
 TRAIN:
   EXP_PATH: exp/uem_flow_8gpu_e300
