@@ -50,6 +50,38 @@ reproducibility notes are documented in [ablation/README.md](ablation/README.md)
 ablation results and inference benchmark are reported in [result.md](result.md). Generated
 checkpoints, predictions, dataset files, and SMPL-X model files are intentionally not versioned.
 
+## K12 稀疏关节测评
+
+K12 模型不再预测完整的 22 个 SMPL22 身体关节块，而是只预测固定的 12 个稀疏关节：
+
+```text
+[0, 4, 5, 10, 11, 13, 14, 15, 18, 19, 20, 21]
+```
+
+它们分别对应 pelvis、双膝、双脚端点、双肩、head、双肘和双腕。测评将 K12 与稠密 E7
+模型、原论文 Diffusion 模型在相同的 12 个关节上进行比较，使用验证集 256 个窗口，包含
+recon、forecast 和 generation 三个任务。本对比不使用全身恢复器。
+
+误差在 canonical `v4_beta` 关节块表示空间中计算：位置误差单位为 mm，旋转误差单位为
+degree，位置速度误差单位为 mm/s。
+
+| 模型 | 任务 | 位置误差 (mm) | 旋转误差 (deg) | 位置速度误差 (mm/s) |
+|---|---|---:|---:|---:|
+| K12 | Recon | 103.55 | 25.06 | 176.57 |
+| E7 | Recon | 100.36 | 24.07 | 173.10 |
+| 原论文 Diffusion | Recon | **98.97** | **23.62** | **163.05** |
+| K12 | Generation | 155.74 | 29.71 | **234.38** |
+| E7 | Generation | **149.91** | **28.74** | 226.40 |
+| 原论文 Diffusion | Generation | 161.36 | 30.47 | 232.63 |
+| K12 | Forecasting | 149.71 | 30.60 | **229.53** |
+| E7 | Forecasting | **139.83** | **29.75** | 231.86 |
+| 原论文 Diffusion | Forecasting | 154.54 | 30.84 | 242.70 |
+
+原始 K12 指标保存在本地实验文件
+[`exp/sparse_joint_eval_k12_comparison/k12.json`](exp/sparse_joint_eval_k12_comparison/k12.json)
+中（如果保留实验产物）。详细测评报告见 [`result.md`](result.md)。这些结果只衡量选定的
+12 个预测关节，不能代表未预测的 10 个关节或完整身体 SMPL-X 的恢复质量。
+
 ## Pretrained UniEgoMotion Model
 Download the pretrained model from [here](https://downloads.cs.stanford.edu/simurgh/chpatel/uem_v4b_dinov2.zip) or [here](https://huggingface.co/datasets/chaitanya100100/uniegomotion/tree/main) and place it in the `exp/` directory.
 
