@@ -432,6 +432,13 @@ class UniEgoMotion(nn.Module):
             return None
         return self._last_moe_aux_loss
 
+    def set_moe_inference_mode(self, mode="top2", seed=62):
+        """Apply an evaluation-only routing mode to every layer's MoE FFN."""
+        if not self.motion_expert_enabled:
+            raise RuntimeError("MoE inference routing modes require MODEL.MOTION_EXPERT.ENABLED.")
+        for layer_index, block in enumerate(self.tsfm):
+            block.ff.set_inference_routing_mode(mode, seed=int(seed) + 100003 * layer_index)
+
     def initialize_motion_expert_from_dense(self, dense_state, noise_std=0.01):
         """Initialize the new MoE from a dense K12 model state.
 

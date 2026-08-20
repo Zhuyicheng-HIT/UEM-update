@@ -85,6 +85,23 @@ class MoEFeedForward(nn.Module):
         self.last_aux_loss = None
         self.last_router_probs = None
         self.last_top_indices = None
+        # Evaluation-only routing override.  Training always uses the configured
+        # top-k router, so checkpoint optimization is unaffected by the
+        # ablations below.
+        self.inference_routing_mode = "top2"
+        self.random_routing_seed = 62
+        self._random_routing_calls = 0
+
+    def set_inference_routing_mode(self, mode="top2", seed=62):
+        """Select an evaluation routing ablation without changing parameters."""
+        aliases = {"topk": "top2", "random": "random_top2", "shared": "shared_only"}
+        mode = aliases.get(str(mode).lower(), str(mode).lower())
+        valid = {"top2", "top1", "random_top2", "shared_only"}
+        if mode not in valid:
+            raise ValueError(f"Unknown MoE inference routing mode {mode!r}; expected {sorted(valid)}.")
+        self.inference_routing_mode = mode
+        self.random_routing_seed = int(seed)
+        self._random_routing_calls = 0
 
     @staticmethod
     def _masked_mean(x, mask):
@@ -165,14 +182,40 @@ class MoEFeedForward(nn.Module):
     def forward(self, x, router_conditions=None, frame_mask=None):
         original_shape = x.shape
         flat_x = x.reshape(-1, self.dim)
+        routing_mode = "top2" if self.training else self.inference_routing_mode
+        if routing_mode == "shared_only":
+            self.last_aux_loss = None
+            self.last_router_probs = None
+            self.last_top_indices = None
+            if self.shared is None:
+                raise RuntimeError("shared_only routing requires an enabled shared expert.")
+            return self.shared(flat_x).reshape(original_shape)
+
         router_logits = self._router_logits(x, router_conditions=router_conditions, frame_mask=frame_mask)
         if self.training and self.router_jitter > 0:
             router_logits = router_logits + torch.randn_like(router_logits) * self.router_jitter
         router_probs = torch.softmax(router_logits, dim=-1)
-        top_values, top_indices = torch.topk(router_probs, self.top_k, dim=-1)
-        top_weights = top_values / top_values.sum(dim=-1, keepdim=True).clamp_min(1e-8)
-        flat_top_indices = top_indices.reshape(-1, self.top_k)
-        flat_top_weights = top_weights.reshape(-1, self.top_k)
+        if routing_mode == "random_top2":
+            # Use a private, per-layer deterministic generator so random-route
+            # ablations do not consume or perturb the Flow sampler's noise RNG.
+            generator = torch.Generator(device=router_probs.device)
+            generator.manual_seed(self.random_routing_seed + self._random_routing_calls)
+            self._random_routing_calls += 1
+            random_scores = torch.rand(
+                router_probs.shape,
+                device=router_probs.device,
+                dtype=router_probs.dtype,
+                generator=generator,
+            )
+            top_indices = torch.topk(random_scores, 2, dim=-1).indices
+            top_weights = torch.full_like(top_indices, 0.5, dtype=router_probs.dtype)
+        else:
+            effective_top_k = 1 if routing_mode == "top1" else self.top_k
+            top_values, top_indices = torch.topk(router_probs, effective_top_k, dim=-1)
+            top_weights = top_values / top_values.sum(dim=-1, keepdim=True).clamp_min(1e-8)
+        effective_top_k = top_indices.shape[-1]
+        flat_top_indices = top_indices.reshape(-1, effective_top_k)
+        flat_top_weights = top_weights.reshape(-1, effective_top_k)
 
         flat_output = torch.zeros_like(flat_x)
         # Each selected token is evaluated only by the experts assigned to it.
