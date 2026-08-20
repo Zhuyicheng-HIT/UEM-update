@@ -133,6 +133,12 @@ class SMPLXGeometryLoss(nn.Module):
         super().__init__()
         if cfg.DATA.REPRE_TYPE != "v4_beta":
             raise ValueError("E19 SMPL-X geometry loss currently requires DATA.REPRE_TYPE=v4_beta.")
+        sparse_cfg = getattr(cfg, "SPARSE_JOINTS", None)
+        if sparse_cfg is not None and bool(getattr(sparse_cfg, "ENABLED", False)):
+            raise ValueError(
+                "E19 SMPL-X geometry loss decodes the dense 243D v4_beta representation "
+                "and cannot be combined with SPARSE_JOINTS."
+            )
 
         geometry_cfg = cfg.TRAIN.GEOMETRY_LOSS
         self.weight = float(geometry_cfg.WEIGHT)

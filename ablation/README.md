@@ -399,11 +399,33 @@ ablation/configs/e20_mixed_batch_w8_u84k.yaml
 从零训练任一实验：
 
 ```bash
-python run/train_uem.py CONFIG ablation/configs/e17_task_global_weight_w8_u84k.yaml
-python run/train_uem.py CONFIG ablation/configs/e18_task_film_w8_u84k.yaml
-python run/train_uem.py CONFIG ablation/configs/e19_smplx_geometry_w8_u84k.yaml
-python run/train_uem.py CONFIG ablation/configs/e20_mixed_batch_w8_u84k.yaml
+bash ablation/scripts/train_e17_task_global_weight.sh
+bash ablation/scripts/train_e18_task_film.sh
+bash ablation/scripts/train_e19_smplx_geometry.sh
+bash ablation/scripts/train_e20_mixed_batch.sh
 ```
+
+单项脚本默认使用两张卡 `0,1`，可通过环境变量覆盖。例如：
+
+```bash
+CUDA_VISIBLE_DEVICES=4,5 PYTHON_BIN=/root/miniconda3/envs/uem/bin/python \
+  bash ablation/scripts/train_e19_smplx_geometry.sh
+```
+
+在八张卡上同时启动四组实验（每组两卡）使用：
+
+```bash
+PYTHON_BIN=/root/miniconda3/envs/uem/bin/python \
+  bash ablation/scripts/launch_e17_e20_8gpu.sh
+```
+
+并行入口将 E17/E18/E19/E20 分别绑定到 `0,1` / `2,3` / `4,5` / `6,7`，
+日志保存在 `exp/ablation/launch_logs/e17_e20_<时间>/`。额外的 YACS 覆盖项会转发给
+四个训练进程，例如可在正式启动前用 `TRAIN.MAX_STEPS 2` 做短冒烟测试。当前服务器若未
+显式设置 `UEM_DATA_DIR`，脚本会自动识别仓库相邻的
+`../datasets/ee4d_motion_uniegomotion`；其他环境应显式导出该变量。E19 还会在启动前
+检查 `SMPLX_NEUTRAL.npz`。若只想核对 GPU、数据和最终命令而不启动训练，可添加
+`DRY_RUN=1`。
 
 正式比较必须对 E14 和 E17--E20 使用同一验证样本、seed、Euler10、checkpoint选择规则和
 三任务评测脚本。E17--E20 的单项胜负应优先看每个任务的完整指标，不只看训练 Flow loss。

@@ -456,6 +456,13 @@ class UEM_Module(pl.LightningModule):
     def validation_step(self, batch, batch_idx, dataloader_idx=0):
         if self.task_schedule is not None and self.task_schedule.mode == "adaptive":
             return self._adaptive_validation_step(batch, batch_idx)
+        if self.task_schedule is not None:
+            # Validation for the fixed/curriculum explicit-task experiments is
+            # the deterministic reconstruction task.  Raw validation batches
+            # are equivalent in terms of visible conditions, but do not carry
+            # a task_id; E17's task-specific global weights and E18's TaskFiLM
+            # both require that identity to be explicit.
+            batch = self._batch_for_task(batch, "recon")
         return self.training_step(batch, batch_idx, mode="val")
 
     def on_validation_epoch_start(self):
