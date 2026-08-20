@@ -661,16 +661,21 @@ class UniEgoMotion(nn.Module):
                 raise ValueError(f"encoder_tsfm is {self.encoder_tsfm}")
 
             for enc in self.tsfm:
-                x = enc(x=x, mask=mask, router_conditions=router_conditions)
+                if self.motion_expert_enabled:
+                    x = enc(x=x, mask=mask, router_conditions=router_conditions)
+                else:
+                    x = enc(x=x, mask=mask)
         else:
             for dec in self.tsfm:
-                x = dec(
-                    x=x,
-                    context=context,
-                    mask=mask,
-                    context_mask=context_mask,
-                    router_conditions=router_conditions,
-                )
+                decoder_kwargs = {
+                    "x": x,
+                    "context": context,
+                    "mask": mask,
+                    "context_mask": context_mask,
+                }
+                if self.motion_expert_enabled:
+                    decoder_kwargs["router_conditions"] = router_conditions
+                x = dec(**decoder_kwargs)
 
         if self.motion_expert_enabled:
             aux_losses = [

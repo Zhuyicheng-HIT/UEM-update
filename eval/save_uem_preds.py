@@ -31,7 +31,11 @@ def main():
     distributed = world_size > 1
     if distributed:
         torch.cuda.set_device(local_rank)
-        dist.init_process_group(backend="nccl")
+        # Inference ranks do not exchange CUDA tensors; they only synchronize
+        # before rank zero merges CPU prediction shards.  Gloo keeps this path
+        # compatible with GPUs whose compute capability is newer than the
+        # CUDA/NCCL build installed in the evaluation environment.
+        dist.init_process_group(backend="gloo")
     device = torch.device("cuda", local_rank)
 
     pl.seed_everything(62 + rank, workers=True)
@@ -153,7 +157,7 @@ def main():
     shard_path = f"{save_path}.rank-{rank:02d}-of-{world_size:02d}.part"
     joblib.dump(all_preds, shard_path)
     if distributed:
-        dist.barrier(device_ids=[local_rank])
+        dist.barrier()
 
     if rank == 0:
         merged_preds = {}
@@ -174,7 +178,7 @@ def main():
         logger.info(f"Saved {len(merged_preds)} predictions at {save_path}")
 
     if distributed:
-        dist.barrier(device_ids=[local_rank])
+        dist.barrier()
         dist.destroy_process_group()
     # IPython.embed()
 
