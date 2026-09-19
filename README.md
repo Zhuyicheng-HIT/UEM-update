@@ -1,134 +1,119 @@
-# UniEgoMotion
-This repository provides the dataset and code for the following paper: 
+# UEM-E7：完整身体 Flow Matching codebase
+
+本分支从 `sxh-kk/UEM-update` 的 `156ab79d5f692a6e8db3c3eb769abf1e4cb1fc08` 提取 **dense E7**，只保留 E7 的训练、采样、数据、评估、可视化及必要公共依赖。
+
+- 输出：`[B, 80, 243]`，完整 `v4_beta`，不是 K12 稀疏模型。
+- 输入：18D Aria 轨迹、1024D DINOv2 特征、有效帧 mask。
+- 训练：预测干净运动 `x0`；全局 SE(3) `[198:207]` 损失权重 **8**；保留原随机条件 mask、Beta 时间分布和 EMA。
+- 采样：**Euler 10 步**。
+- 新增：可开关的 **Flow 历史约束采样**，默认关闭；关闭时保持原始 E7 数值行为。
+
+Diffusion、LSTM/UNet、K12/MoE、双输出头、显式任务课程、TaskFiLM、训练几何损失、其他实验配置与结果报告已从工作树删除。共享的 SMPL-X、坐标变换、评估和渲染代码保留。Git 历史仍可追溯源版本。
+
+## 安装和资产
+
+建议按原 E7 环境使用 Python 3.10、兼容 GPU 的 PyTorch/CUDA，再安装：
+
+```bash
+pip install -r requirements.txt
+pip install -r requirements-dev.txt
+# 仅可视化需要：
+pip install -r requirements-vis.txt
 ```
-UniEgoMotion: A Unified Model for Egocentric Motion Reconstruction, Forecasting, and Generation
-Chaitanya Patel, Hiroki Nakamura, Yuta Kyuragi, Kazuki Kozuka, Juan Carlos Niebles, Ehsan Adeli
-ICCV 2025  
+
+本次验证环境为 Python 3.12、PyTorch 2.12.0 CPU；GPU 训练和真实数据指标尚未复测。PyTorch 请按实际 CUDA 环境单独安装。
+
+需要单独准备：
+
+1. [processed EE4D-Motion](https://huggingface.co/datasets/chaitanya100100/uniegomotion/tree/main) 数据和 DINOv2 特征，设 `UEM_DATA_DIR`。
+2. SMPL-X v1.1 的 `SMPLX_NEUTRAL.npz`，置于 `body_models/smplx/`，或设 `SMPLX_MODEL_PATH` 指向包含该文件的目录。
+3. **真实 E7 checkpoint**，自行提供。上游未版本化训练权重；本分支不包含 E7 权重。官方 Diffusion checkpoint 不能作为 E7 权重使用。
+
+数据目录细节见 [DATASET.md](DATASET.md)。
+
+## 训练与评估
+
+从仓库根目录使用 `python -m`，避免导入路径依赖：
+
+```bash
+python -m run.train_uem CONFIG config/e7.yaml TRAIN.EXP_PATH exp/e7
+python -m eval.eval_exp CONFIG config/e7.yaml TRAIN.EXP_PATH exp/e7 MODEL.CKPT_PATH last_ckpt
 ```
-[[Project Website](https://chaitanya100100.github.io/UniEgoMotion)]
-[[ArXiv](https://arxiv.org/abs/2508.01126)]
 
-![Teaser](assets/teaser.png)
+`config/e7.yaml` 保留源 E7 的 batch=256、2 GPU、300 epochs、学习率、EMA 和调度设置；这不是对当前机器显存适配后的配置。可按硬件覆盖 `DATA.BATCH_SIZE`、`TRAIN.NUM_GPUS` 等，但复现时需记录变更。默认评估仍为原 E7 的 256 个抽样窗口及 12 个关键关节指标；**模型输出始终是完整 243D**。
 
-## Citation
-Cite us if you use our model, code or data:
-```
-@inproceedings{patel2025uniegomotion,
-        title={UniEgoMotion: A Unified Model for Egocentric Motion Reconstruction, Forecasting, and Generation},
-        author={Patel, Chaitanya and Nakamura, Hiroki and Kyuragi, Yuta and Kozuka, Kazuki and Niebles, Juan Carlos and Adeli, Ehsan},
-        booktitle={Proceedings of the IEEE/CVF International Conference on Computer Vision},
-        pages={10318--10329},
-        year={2025}
-      }
+全量抽样验证和 22 身体关节评估可覆盖：
+
+```bash
+python -m eval.eval_exp CONFIG config/e7.yaml TRAIN.EXP_PATH exp/e7 MODEL.CKPT_PATH last_ckpt EVAL.NUM_SAMPLES 0 EVAL.KEY_JOINTS_ONLY False
 ```
 
-## Installation
-The code is tested on Python 3.10, PyTorch 2.5.1, and CUDA 11.8 on a single L40S GPU. However, it should work on most modern GPUs with any recent PyTorch and CUDA version.
+以上评估仍是独立窗口，尚不是连续历史策略评测。可选语义指标默认关闭，启用前需单独准备 TMR/STMC，并配置 `model/tmr_eval_model.py` 中的路径。
+
+## 历史约束开关
+
+配置项：
+
+```yaml
+FLOW:
+  REPAINT_ENABLED: False  # True 开启，False 关闭
 ```
-conda create --name uem python=3.10
-conda activate uem
 
-# Install Pytorch with your own CUDA version
-pip3 install torch --index-url https://download.pytorch.org/whl/cu118
+Python 调用可逐候选覆盖配置，便于在同一个模型上比较 K/R：
 
-pip3 install pytorch_lightning==2.4.0
-pip3 install -r requirements.txt
+```python
+model.eval()
+# y 为已准备好的输入，张量位于模型设备上。
+# history 必须已换到当前窗口坐标并按训练统计归一化。
+y_keep = dict(y)
+y_keep["repaint_value"] = history              # [B, 80, 243]
+y_keep["repaint_mask"] = torch.zeros_like(history, dtype=torch.bool)
+y_keep["repaint_mask"][:, :70] = True         # 示例：前 70 帧历史
+noise = torch.randn_like(history)             # 两个候选共享噪声
+
+with torch.inference_mode():
+    keep = model.sample(y_keep, B=history.shape[0], noise=noise, repaint_enabled=True)
+    release = model.sample(y_keep, B=history.shape[0], noise=noise, repaint_enabled=False)
 ```
-Download **SMPL-X v1.1** from [here](https://smpl-x.is.tue.mpg.de/download.php) and extract
-`SMPLX_NEUTRAL.npz` to `body_models/smplx/`. Alternatively, set `SMPLX_MODEL_PATH` to the directory
-containing `SMPLX_NEUTRAL.npz`.
 
-## EE4D-Motion Dataset
-See [DATASET.md](DATASET.md) to download and setup the dataset. This is required to run the model.
-Set `UEM_DATA_DIR` to the extracted `ee4d_motion_uniegomotion` directory, or place it at
-`data/ee4d_motion_uniegomotion`.
+调用优先级：`sample(..., repaint_enabled=...)` > `FLOW.REPAINT_ENABLED`。参数为 `None` 时读取配置。
 
-## Flow Matching Experiments (E1–E20)
+- 关闭：忽略 `repaint_mask/repaint_value`，执行原始 E7。
+- 开启：两者同时提供时生效；mask/value 必须与输出形状完全一致，mask 只接受 0/1 或 bool。缺少一项、形状错误、固定位置有 NaN/Inf 时明确报错。
+- 开启但两者都不提供：保持无约束生成，用于冷启动；全零 mask 也等价于无约束。
+- 不修改调用者的 `y`、历史张量或噪声；不自动构造或更新历史。
+- 约束仅用于推理。训练批次携带约束且开关开启时会报错，防止把目标夹持混入 E7 原始训练。
 
-The Flow Matching implementation, B0/E1–E20 configurations, launch/evaluation scripts, and
-reproducibility notes are documented in [ablation/README.md](ablation/README.md). The 256-sample
-ablation results and inference benchmark are reported in [result.md](result.md). Generated
-checkpoints, predictions, dataset files, and SMPL-X model files are intentionally not versioned.
-
-## K12 稀疏关节测评
-
-K12 模型不再预测完整的 22 个 SMPL22 身体关节块，而是只预测固定的 12 个稀疏关节：
+这是 **Flow 路径投影式历史约束**，不是移植 DDPM RePaint 重采样算法。对固定位置，在每个时间点施加：
 
 ```text
-[0, 4, 5, 10, 11, 13, 14, 15, 18, 19, 20, 21]
+x_t[mask] = (1 - t) * history[mask] + t * initial_noise[mask]
+x0_prediction[mask] = history[mask]
 ```
 
-它们分别对应 pelvis、双膝、双脚端点、双肩、head、双肘和双腕。测评将 K12 与稠密 E7
-模型、原论文 Diffusion 模型在相同的 12 个关节上进行比较，使用验证集 256 个窗口，包含
-recon、forecast 和 generation 三个任务。本对比不使用全身恢复器。
+Euler 更新后再次投影到下一时刻的相同路径，最终 `t=0` 的固定表示值严格等于 history。它会影响后续模型调用的上下文，而不是只在最终结果上拼接。
 
-误差在 canonical `v4_beta` 关节块表示空间中计算：位置误差单位为 mm，旋转误差单位为
-degree，位置速度误差单位为 mm/s。
+**它保证固定运动表示值，不保证真实人体重建质量。** 跨窗口坐标、首帧 SE(3) 增量重编码、体型一致性、prediction-only 解码及完整 take 回放仍需在上层实现；不要直接把旧窗口的 243D 切片当作新窗口历史。尤其 beta 在解码时按窗口平均，固定表示不自动等于固定所有 FK 关节。
 
-| 模型 | 任务 | 位置误差 (mm) | 旋转误差 (deg) | 位置速度误差 (mm/s) |
-|---|---|---:|---:|---:|
-| K12 | Recon | 103.55 | 25.06 | 176.57 |
-| E7 | Recon | 100.36 | 24.07 | 173.10 |
-| 原论文 Diffusion | Recon | **98.97** | **23.62** | **163.05** |
-| K12 | Generation | 155.74 | 29.71 | **234.38** |
-| E7 | Generation | **149.91** | **28.74** | 226.40 |
-| 原论文 Diffusion | Generation | 161.36 | 30.47 | 232.63 |
-| K12 | Forecasting | 149.71 | 30.60 | **229.53** |
-| E7 | Forecasting | **139.83** | **29.75** | 231.86 |
-| 原论文 Diffusion | Forecasting | 154.54 | 30.84 | 242.70 |
+## 从条件文件采样
 
-原始 K12 指标保存在本地实验文件
-[`exp/sparse_joint_eval_k12_comparison/k12.json`](exp/sparse_joint_eval_k12_comparison/k12.json)
-中（如果保留实验产物）。详细测评报告见 [`result.md`](result.md)。这些结果只衡量选定的
-12 个预测关节，不能代表未预测的 10 个关节或完整身体 SMPL-X 的恢复质量。
+把输入字典以 `torch.save(y, "conditions.pt")` 保存，可直接运行：
 
-## Pretrained UniEgoMotion Model
-Download the pretrained model from [here](https://downloads.cs.stanford.edu/simurgh/chpatel/uem_v4b_dinov2.zip) or [here](https://huggingface.co/datasets/chaitanya100100/uniegomotion/tree/main) and place it in the `exp/` directory.
-
-## Visualizing UniEgoMotion Outputs
-Run the following command to visualize UniEgoMotion outputs on some validation samples for all three tasks.
-```
-python run/vis_uem.py \
-CONFIG ./config/uem.yaml \
-TRAIN.EXP_PATH ./exp/uem_v4b_dinov2/ \
-MODEL.CKPT_PATH last_ckpt
+```bash
+python -m run.sample_e7 --checkpoint exp/e7/last.ckpt --conditioning conditions.pt --output output/release.pt --repaint off --seed 62
+python -m run.sample_e7 --checkpoint exp/e7/last.ckpt --conditioning conditions.pt --output output/keep.pt --repaint on --seed 62
 ```
 
-## Training and Evaluating UniEgoMotion from Scratch
-Run the following to train UniEgoMotion model. Use an appropriate experiment path to save training logs and model checkpoints.
-```
-python run/train_uem.py \
-CONFIG ./config/uem.yaml \
-TRAIN.EXP_PATH <exp_path>
-```
+`--repaint on` 要求条件文件含 mask/value；命令行不会隐式生成历史。也可用 `--noise noise.pt` 为两个调用指定相同初始噪声。输出 `motion` 是**归一化的 243D 表示**，不是米制关节坐标。
 
-Run the following command to evaluate UniEgoMotion model on the validation set. It will save the predictions for all three tasks in the experiment directory, and compute 3D and semantic metrics. You will need to setup TMR model through [this repo](https://github.com/nv-tlabs/stmc) and set the path in `model/tmr_eval_model.py`.
-```
-python eval/eval_exp.py \
-CONFIG ./config/uem.yaml \
-TRAIN.EXP_PATH <exp_path> \
-MODEL.CKPT_PATH last_ckpt
+## 验证与来源
+
+```bash
+python -m pytest tests -q
+# 可选：与另一个未经修改的上游 checkout 做数值回归比较
+python -m tools.check_upstream_e7 --upstream /path/to/original/UEM-update
 ```
 
-Run the following command to visualize some saved predictions for a particular task.
-```
-python eval/vis_uem_preds.py \
---EXP_PATH <exp_path> \
---EVAL_TASK <task>
-```
+比较脚本在 CPU 上使用相同的随机初始化 E7 权重和合成输入，检查 strict state_dict 加载、优化器参数顺序、三任务 forward、CFG、80 帧 Euler10、训练损失和梯度。结果见 [数值对照](verification/upstream_e7_parity.json)。真实预训练模型精度和 GPU 性能未在本次验证中测量。
 
-### Baselines and Ablations
-Commands to train UniEgoMotion model and some ablation experiments:
-- `python run/train_uem.py CONFIG ./config/uem.yaml TRAIN.EXP_PATH <exp_path>` for original UniEgoMotion model.
-- Use `MODEL.ENCODER_TSFM add` to train transformer encoder baseline.
-- Use `DATA.REPRE_TYPE v1_beta` to train with global motion representation. See `dataset.representation_utils.py` for the explanation of different motion representations. You will need to compute the statistics for this representation first. See [DATASET.md](DATASET.md) for more details.
-- Use `DATA.COND_IMG_FEAT False` to train without egocentric video conditioning i.e. only conditioned on egocentric trajectory.
-- Use `DATA.IMG_FEAT_TYPE clip_all` to train with CLIP features instead of DINOv2. Note that you will need to extra CLIP features for all takes and collect them into one file per split. See [DATASET.md](DATASET.md) for more details.
-
-Commands to train baselines:
-- See [this](https://github.com/chaitanya100100/UniEgoMotion/issues/2) issue for the updated head tracking metrics of egoallo.
-- `python run/train_uem.py CONFIG ./config/lstm.yaml TRAIN.EXP_PATH <exp_path> MODEL.LSTM_TYPE gen` to train LSTM baseline for egocentric motion generation. Use `MODEL.LSTM_TYPE fore` for forecasting baseline.
-- `python run/train_uem.py CONFIG ./config/uem_traj.yaml TRAIN.EXP_PATH <exp_path>` to train UniEgoMotion trajectory prediction model (instead of whole body pose). The trajectory conditioned motion prediction model will be the original UniEgoMotion model. Use `CONFIG ./config/uem_twostage.yaml` with appropriate arguments for evaluation and visualization.
-
-
-If you have any questions or concerns about the code or dataset, please open an issue.
+源项目为 [UniEgoMotion](https://github.com/chaitanya100100/UniEgoMotion)，Chaitanya Patel 等，ICCV 2025；E7 扩展来自 [UEM-update](https://github.com/sxh-kk/UEM-update)。使用模型、数据和代码时请引用原论文并保留各文件原有许可说明。来源及清理说明见 [SOURCE.md](SOURCE.md)。

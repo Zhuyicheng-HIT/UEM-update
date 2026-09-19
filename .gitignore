@@ -13,3 +13,5 @@ datasets/
 jnb/
 .vscode/
 body_models/
+.venv/
+verification/*.ckpt

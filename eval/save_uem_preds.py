@@ -1,7 +1,6 @@
 import copy
 import os
 import sys
-
 import IPython
 import joblib
 import numpy as np
@@ -10,18 +9,12 @@ import torch
 import torch.distributed as dist
 from loguru import logger
 from tqdm.auto import tqdm
-
 from config.defaults import get_cfg
 from dataset.ee4d_motion_dataset import EE4D_Motion_DataModule, careful_collate_fn
 from dataset.ee4d_motion_dataset import EE4D_Motion_Dataset
 from module.ema import apply_ema_weights_from_checkpoint
-from module.uem_module import UEM_Module, UEM_Module_TwoStage
+from module.uem_module import UEM_Module
 from utils.torch_utils import to_device
-
-# rlimit = resource.getrlimit(resource.RLIMIT_NOFILE)
-# resource.setrlimit(resource.RLIMIT_NOFILE, (2048, rlimit[1]))
-# torch.multiprocessing.set_sharing_strategy("file_system")
-# os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
 
 def main():
@@ -31,26 +24,16 @@ def main():
     distributed = world_size > 1
     if distributed:
         torch.cuda.set_device(local_rank)
-        # Inference ranks do not exchange CUDA tensors; they only synchronize
-        # before rank zero merges CPU prediction shards.  Gloo keeps this path
-        # compatible with GPUs whose compute capability is newer than the
-        # CUDA/NCCL build installed in the evaluation environment.
         dist.init_process_group(backend="gloo")
     device = torch.device("cuda", local_rank)
-
     pl.seed_everything(62 + rank, workers=True)
-    sys.argv = sys.argv + [
-        "TRAIN.ONLY_VALIDATE",
-        "True",
-    ]
+    sys.argv = sys.argv + ["TRAIN.ONLY_VALIDATE", "True"]
     cfg = get_cfg()
     assert cfg.TRAIN.EXP_PATH is not None
     assert os.path.exists(cfg.TRAIN.EXP_PATH)
     assert cfg.TRAIN.EVAL_TASK in ["recon", "gen", "fore"]
     ds_name = "ee4d"
     split = "val"
-
-    # save path
     save_path = f"{cfg.TRAIN.EXP_PATH}/preds_{ds_name}_{cfg.TRAIN.EVAL_TASK}{cfg.TRAIN.EVAL_SUFFIX}.pkl"
     if os.path.exists(save_path):
         if rank == 0:
@@ -58,8 +41,6 @@ def main():
         if distributed:
             dist.destroy_process_group()
         return
-
-    # dataset
     ds_class = {"ee4d": EE4D_Motion_Dataset}[ds_name]
     ds = ds_class(
         data_dir=cfg.DATA.DATA_DIR,
@@ -71,47 +52,27 @@ def main():
         img_feat_type=cfg.DATA.IMG_FEAT_TYPE,
         cond_betas=cfg.DATA.COND_BETAS,
     )
+    ckpt_path = cfg.MODEL.CKPT_PATH
+    if cfg.MODEL.CKPT_PATH == "last_ckpt":
+        ckpt_path = os.path.join(cfg.TRAIN.EXP_PATH, "last.ckpt")
+    assert os.path.exists(ckpt_path), f"Checkpoint path {ckpt_path} does not exist"
+    logger.info(f"Loading model from {ckpt_path}")
+    model = UEM_Module.load_from_checkpoint(ckpt_path, cfg=cfg, map_location="cpu")
+    checkpoint = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+    if apply_ema_weights_from_checkpoint(model.model, checkpoint):
+        logger.info("Using EMA weights stored in the checkpoint for evaluation.")
+    del checkpoint
+    model = model.to(device).eval()
 
-    is_twostage = cfg.MODEL.TRAJ_CKPT_PATH is not None
-
-    # Model with checkpoint
-    if not is_twostage:
-        ckpt_path = cfg.MODEL.CKPT_PATH
-        if cfg.MODEL.CKPT_PATH == "last_ckpt":
-            ckpt_path = os.path.join(cfg.TRAIN.EXP_PATH, "last.ckpt")
-        assert os.path.exists(ckpt_path), f"Checkpoint path {ckpt_path} does not exist"
-        logger.info(f"Loading model from {ckpt_path}")
-        model = UEM_Module.load_from_checkpoint(ckpt_path, cfg=cfg, map_location="cpu")
-        checkpoint = torch.load(ckpt_path, map_location="cpu", weights_only=False)
-        if apply_ema_weights_from_checkpoint(model.model, checkpoint):
-            logger.info("Using EMA weights stored in the checkpoint for evaluation.")
-        del checkpoint
-        model = model.to(device).eval()
-    else:
-        model = UEM_Module_TwoStage(cfg=cfg).to(device).eval()
-
-    # --------------------------------------------
-    # Batch processing
-    # --------------------------------------------
     def process_batch(pred_batch, all_preds):
         B = len(pred_batch)
         pred_batch = careful_collate_fn(pred_batch)
-
         with torch.inference_mode():
             y = to_device(pred_batch["y"], device)
             x = model.sample(y, B, cond_scale=cfg.TRAIN.COND_SCALE, return_all_pred_xstart=False)
-            if not is_twostage:
-                if cfg.MODEL.LEARN_TRAJ:
-                    pred_batch["pred"]["traj"] = to_device(x, "cpu")
-                else:
-                    pred_batch["pred"]["motion"] = to_device(x, "cpu")
-            else:
-                pred_batch["pred"]["traj"] = to_device(x[0], "cpu")
-                pred_batch["pred"]["motion"] = to_device(x[1], "cpu")
-
+            pred_batch["pred"]["motion"] = to_device(x, "cpu")
         pred_mdata = ds.ret_to_full_sequence(pred_batch)
         pred_mdata = to_device(pred_mdata, "cpu")
-
         for i in range(B):
             seq_name = pred_batch["misc"]["seq_name"][i]
             start_idx = pred_batch["misc"]["start_idx"][i] // 3
@@ -123,42 +84,28 @@ def main():
             }
         return all_preds
 
-    # --------------------------------------------
-    # --------------------------------------------
-
     all_preds = {}
     batch_size = cfg.EVAL.BATCH_SIZE
     batch = []
-
-    # We evaluate every 10th sample to make evaluation manageable.
-    # Considering the segment_stride of 2 seconds, this will evaluate one 8 second sample every 20 seconds (200 frames).
     eval_indices = list(range(0, len(ds), 10))
     if cfg.EVAL.NUM_SAMPLES > 0:
         eval_indices = eval_indices[: cfg.EVAL.NUM_SAMPLES]
     local_indices = eval_indices[rank::world_size]
-    logger.info(
-        f"Rank {rank}/{world_size}: evaluating {len(local_indices)} of {len(eval_indices)} samples"
-    )
+    logger.info(f"Rank {rank}/{world_size}: evaluating {len(local_indices)} of {len(eval_indices)} samples")
     for idx in tqdm(local_indices, disable=rank != 0):
         sample = ds[idx]
         sample = ds.process_sample_for_task(sample, cfg.TRAIN.EVAL_TASK)
         batch.append(sample)
-
         if len(batch) >= batch_size:
             all_preds = process_batch(batch, all_preds)
             batch = []
-
     if len(batch) > 0:
         all_preds = process_batch(batch, all_preds)
         batch = []
-
-    # Each rank writes a private shard. Rank zero merges them atomically so no
-    # process can overwrite another rank's predictions.
     shard_path = f"{save_path}.rank-{rank:02d}-of-{world_size:02d}.part"
     joblib.dump(all_preds, shard_path)
     if distributed:
         dist.barrier()
-
     if rank == 0:
         merged_preds = {}
         shard_paths = [f"{save_path}.rank-{r:02d}-of-{world_size:02d}.part" for r in range(world_size)]
@@ -176,11 +123,9 @@ def main():
         for path in shard_paths:
             os.remove(path)
         logger.info(f"Saved {len(merged_preds)} predictions at {save_path}")
-
     if distributed:
         dist.barrier()
         dist.destroy_process_group()
-    # IPython.embed()
 
 
 if __name__ == "__main__":

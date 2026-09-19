@@ -5,29 +5,18 @@ import torch
 import copy
 import pytorch_lightning as pl
 from tqdm.auto import tqdm
-
-
 from loguru import logger
 from torch.utils.data import Dataset, DataLoader
-
 from dataset.canonicalization import get_a_canonicalized_segment
-from dataset.representation_utils import (
-    V4_BETA_FEATURES,
-    full_to_sparse_motion,
-    repre_to_full_sequence,
-    saved_sequence_to_repre,
-    sparse_motion_feature_dim,
-    sparse_motion_feature_indices,
-    validate_sparse_body_joint_indices,
-)
+from dataset.representation_utils import repre_to_full_sequence, saved_sequence_to_repre
 from dataset.smpl_utils import get_smpl, evaluate_smpl
-from utils.vis_utils import save_video, visualize_sequence, visualize_sequence_blender
 from utils.torch_utils import careful_collate_fn
 from utils.task_conditioning import apply_task_conditioning
 from dataset.feats import ImageFeats
 
 
 class EE4D_Motion_Dataset(Dataset):
+
     def __init__(
         self,
         *,
@@ -40,7 +29,6 @@ class EE4D_Motion_Dataset(Dataset):
         window,
         img_feat_type,
         do_normalization=True,
-        sparse_joint_indices=None,
     ):
         super().__init__()
         self.data_dir = data_dir
@@ -51,37 +39,21 @@ class EE4D_Motion_Dataset(Dataset):
         self.img_feat_type = img_feat_type
         self.cond_betas = cond_betas
         self.dataset_name = "ee4d"
-        self.sparse_joint_indices = None
-        if sparse_joint_indices is not None:
-            if self.repre_type not in {"v4_beta", "v5_beta"}:
-                raise ValueError(
-                    "Sparse body-joint prediction supports only v4_beta and v5_beta, "
-                    f"got {self.repre_type!r}."
-                )
-            self.sparse_joint_indices = validate_sparse_body_joint_indices(sparse_joint_indices)
-        self.sparse_joints_enabled = self.sparse_joint_indices is not None
-        self.motion_feature_dim = (
-            sparse_motion_feature_dim(self.sparse_joint_indices)
-            if self.sparse_joints_enabled
-            else {"v1_beta": 234, "v4_beta": 243, "v5_beta": 243}.get(self.repre_type)
-        )
+        if repre_type != "v4_beta":
+            raise ValueError("E7 requires dense v4_beta.")
+        self.motion_feature_dim = 243
         if self.cond_betas:
             logger.warning("Conditioning on betas.")
         assert self.split in ["train", "val"]
         assert self.img_feat_type in ["clip_all", "egovideo", "dinov2", "dinov2_reg"]
-
         if not self.cond_traj:
             logger.warning("NOT USING TRAJ AS CONDITION.")
-
         self.window = window
         self.segment_stride = 20
         self.do_normalization = do_normalization
         if not self.do_normalization:
             logger.warning("NOT NORMALIZING. PLEASE CHECK.")
-
-        # Load SMPL
         self.smpl = get_smpl()
-
         self.load_motion_data()
         self.load_statistics()
         if self.cond_img_feat:
@@ -89,15 +61,10 @@ class EE4D_Motion_Dataset(Dataset):
 
     def load_motion_data(self):
         processed_path = f"{self.data_dir}/uniegomotion/ee_{self.split}.pt"
-
         logger.info(f"Loading {processed_path}.")
         self.motion_data = torch.load(processed_path, weights_only=False)
-
         self.seq_names = list(self.motion_data.keys())
         logger.info(f"Loaded {len(self.motion_data)} sequences.")
-
-        # Create a mapping from index to (seq_idx, frame_idx)
-        # We use a stride of 20 frames to create segments.
         self.idx_to_sidx_fidx = []
         for seq_idx, seq_name in enumerate(self.seq_names):
             T = self.motion_data[seq_name]["num_frames"]
@@ -112,16 +79,11 @@ class EE4D_Motion_Dataset(Dataset):
         loaded_stats = torch.load(
             f"{self.data_dir}/uniegomotion/{self.repre_type}_ee_train_stats.pt", weights_only=False
         )
-        clean_it = lambda x: torch.where(x.abs() < 1e-8, torch.ones_like(x), x)
+        clean_it = lambda x: torch.where(x.abs() < 1e-08, torch.ones_like(x), x)
         loaded_stats["traj_std"] = clean_it(loaded_stats["traj_std"])
         loaded_stats["motion_std"] = clean_it(loaded_stats["motion_std"])
         self.full_stats = loaded_stats
         self.stats = dict(loaded_stats)
-        if self.sparse_joints_enabled:
-            feature_indices = sparse_motion_feature_indices(self.sparse_joint_indices)
-            for key in ("motion_mean", "motion_std", "motion_min", "motion_max"):
-                if key in self.stats:
-                    self.stats[key] = self.stats[key].index_select(0, feature_indices)
 
     def __len__(self):
         return len(self.idx_to_sidx_fidx)
@@ -129,22 +91,21 @@ class EE4D_Motion_Dataset(Dataset):
     def normalize(self, a, k):
         if not self.do_normalization:
             return a
-        na = (a - self.stats[k + "_mean"]) / (self.stats[k + "_std"] + 1e-6)
+        na = (a - self.stats[k + "_mean"]) / (self.stats[k + "_std"] + 1e-06)
         return na
 
     def denormalize(self, a, k):
         if not self.do_normalization:
             return a
-        na = a * (self.stats[k + "_std"] + 1e-6) + self.stats[k + "_mean"]
+        na = a * (self.stats[k + "_std"] + 1e-06) + self.stats[k + "_mean"]
         return na
 
     def pad_to_window(self, ret):
         valid_frames = torch.ones(self.window).long()
         T = ret["misc"]["motion"].shape[0]
         if T != self.window:
-            valid_frames[T:] = 0  # mark invalid frames
+            valid_frames[T:] = 0
             pad_fn = lambda x: torch.cat([x, torch.zeros(self.window - T, *x.shape[1:], dtype=x.dtype)], dim=0)
-
             if "traj" in ret["y"]:
                 ret["y"]["traj"] = pad_fn(ret["y"]["traj"])
             if "img_embs" in ret["y"]:
@@ -154,8 +115,7 @@ class EE4D_Motion_Dataset(Dataset):
                 ret["misc"]["traj"] = pad_fn(ret["misc"]["traj"])
             if "motion" in ret["misc"]:
                 ret["misc"]["motion"] = pad_fn(ret["misc"]["motion"])
-
-        ret["y"]["valid_frames"] = valid_frames  # determines the number of frames
+        ret["y"]["valid_frames"] = valid_frames
         return ret
 
     def __getitem__(self, idx):
@@ -166,8 +126,6 @@ class EE4D_Motion_Dataset(Dataset):
     def get_from_seq_and_st(self, seq_name, st, idx):
         en = min(st + self.window - 1, self.motion_data[seq_name]["num_frames"] - 1)
         floor_height = self.motion_data[seq_name]["floor_height"]
-        # logger.warning(f"Sequence: {seq_name}, start index: {st}, end index: {en}")
-
         segment_data = get_a_canonicalized_segment(
             self.motion_data[seq_name]["smpl_params"],
             self.motion_data[seq_name]["aria_traj"],
@@ -176,7 +134,6 @@ class EE4D_Motion_Dataset(Dataset):
             st,
             en,
         )
-
         motion, traj = saved_sequence_to_repre(
             self.repre_type,
             segment_data["can_aria_traj"],
@@ -185,32 +142,25 @@ class EE4D_Motion_Dataset(Dataset):
             floor_height,
             self.smpl,
         )
-
-        if self.sparse_joints_enabled:
-            motion = full_to_sparse_motion(motion, self.sparse_joint_indices)
-
         motion = self.normalize(motion, "motion")
         traj = self.normalize(traj, "traj")
         if self.cond_img_feat:
             img_embs, valid_img_embs = self.img_feats.get_img_feats(
                 seq_name, segment_data["start_idx"], segment_data["end_idx"]
-            )  # T x 768
-
+            )
         if self.cond_betas:
             betas = segment_data["can_smpl_params"]["betas"][:1].view(10)
-
         ret = {}
-        ret["y"] = {}  # holds conditioning inputs
-        ret["pred"] = {}  # holds predicted outputs
+        ret["y"] = {}
+        ret["pred"] = {}
         if self.cond_traj:
             ret["y"]["traj"] = traj
         if self.cond_img_feat:
             ret["y"]["img_embs"] = img_embs
             ret["y"]["valid_img_embs"] = valid_img_embs
-
         if self.cond_betas:
             ret["y"]["betas"] = betas
-        ret["misc"] = {  # holds ground truth and other metadata
+        ret["misc"] = {
             "seq_name": seq_name,
             "start_idx": segment_data["start_idx"],
             "end_idx": segment_data["end_idx"],
@@ -227,88 +177,61 @@ class EE4D_Motion_Dataset(Dataset):
         if not isinstance(ret["misc"]["seq_name"], list):
             ret = careful_collate_fn([ret])
             is_batch = False
-
-        mdata = {
-            "aria_traj_T": [],
-            "smpl_params_full": [],
-            "kp3d": [],
-            "verts": [],
-            "full_pose": [],
-        }
-
+        mdata = {"aria_traj_T": [], "smpl_params_full": [], "kp3d": [], "verts": [], "full_pose": []}
         assert "motion" not in ret and "traj" not in ret
-
         for i in range(len(ret["misc"]["seq_name"])):
-            vf = ret["y"]["valid_frames"][i].bool()  # T_window
-            # If prediction is available, use it. Otherwise, use ground truth.
+            vf = ret["y"]["valid_frames"][i].bool()
             motion = ret["pred"]["motion"] if "motion" in ret["pred"] else ret["misc"]["motion"]
             traj = ret["pred"]["traj"] if "traj" in ret["pred"] else ret["misc"]["traj"]
             motion = self.denormalize(motion[i][vf], "motion")
             traj = self.denormalize(traj[i][vf], "traj")
-
-            if self.sparse_joints_enabled and motion.shape[-1] != V4_BETA_FEATURES:
-                raise RuntimeError(
-                    "Sparse motion cannot be converted to a full SMPL-X sequence without "
-                    "a sparse-to-full recovery stage. Use sparse-joint metrics instead."
-                )
-
             seq_name = ret["misc"]["seq_name"][i]
-
-            betas = self.motion_data[seq_name]["smpl_params"]["betas"]  # 1 x 10
+            betas = self.motion_data[seq_name]["smpl_params"]["betas"]
             body_root_offset = self.motion_data[seq_name]["body_root_offset"]
             aria_traj_T, smpl_params_full, _ = repre_to_full_sequence(
                 self.repre_type, motion, traj, self.smpl, betas, body_root_offset
             )
             kp3d, verts, full_pose = evaluate_smpl(self.smpl, smpl_params_full)
-
             mdata["aria_traj_T"].append(aria_traj_T)
             mdata["smpl_params_full"].append(smpl_params_full)
             mdata["kp3d"].append(kp3d)
             mdata["verts"].append(verts)
             mdata["full_pose"].append(full_pose)
-
         return mdata if is_batch else {k: v[0] for k, v in mdata.items()}
 
     def process_sample_for_task(self, ret, task):
         ret = copy.deepcopy(ret)
-        ret["y"] = apply_task_conditioning(
-            ret["y"],
-            task,
-            forecast_prefix=self.window // 4,
-        )
+        ret["y"] = apply_task_conditioning(ret["y"], task, forecast_prefix=self.window // 4)
         return ret
 
     def visualize_sample(self, ret, use_blender=False):
+        from utils.vis_utils import visualize_sequence, visualize_sequence_blender
 
         is_batch = True
         if not isinstance(ret["misc"]["seq_name"], list):
             ret = careful_collate_fn([ret])
             is_batch = False
-
-        is_pred_traj, is_pred_motion = "traj" in ret["pred"], "motion" in ret["pred"]
+        is_pred_traj, is_pred_motion = ("traj" in ret["pred"], "motion" in ret["pred"])
         pred_mdata = self.ret_to_full_sequence(ret)
-
         gt_ret = copy.deepcopy(ret)
         gt_ret["pred"] = {}
         gt_mdata = self.ret_to_full_sequence(gt_ret)
-
         vis = []
         for i in range(len(ret["misc"]["seq_name"])):
             vis_fn = visualize_sequence if not use_blender else visualize_sequence_blender
             imgs = vis_fn(
                 aria_traj=gt_mdata["aria_traj_T"][i],
                 verts=gt_mdata["verts"][i],
-                # global_jpos=gt_mdata["kp3d"][i],
                 pred_aria_traj=pred_mdata["aria_traj_T"][i] if is_pred_traj else None,
                 pred_verts=pred_mdata["verts"][i] if is_pred_motion else None,
                 faces=self.smpl.faces,
             )
             vis.append(imgs)
-
         return vis if is_batch else vis[0]
 
 
 class EE4D_Motion_DataModule(pl.LightningDataModule):
+
     def __init__(self, cfg):
         super().__init__()
         self.cfg = cfg
@@ -323,20 +246,12 @@ class EE4D_Motion_DataModule(pl.LightningDataModule):
             window=self.cfg.DATA.WINDOW,
             img_feat_type=self.cfg.DATA.IMG_FEAT_TYPE,
             cond_betas=self.cfg.DATA.COND_BETAS,
-            sparse_joint_indices=(
-                list(self.cfg.SPARSE_JOINTS.INDICES)
-                if getattr(self.cfg, "SPARSE_JOINTS", None) is not None
-                and self.cfg.SPARSE_JOINTS.ENABLED
-                else None
-            ),
         )
         dataset_name = self.cfg.DATA.DATASET_NAME
         assert dataset_name in ["ee4d"]
-
         if stage in ["fit", "train"]:
             self.train_dataset = EE4D_Motion_Dataset(split="train", **kwargs)
             logger.info(f"Train dataset: {len(self.train_dataset)}")
-
         self.val_dataset = EE4D_Motion_Dataset(split="val", **kwargs)
         logger.info(f"Val dataset: {len(self.val_dataset)}")
 
@@ -374,105 +289,3 @@ class EE4D_Motion_DataModule(pl.LightningDataModule):
             drop_last=getattr(self.cfg.DATA, "DROP_LAST", False),
             **loader_kwargs,
         )
-
-
-def save_statistics():
-    repre_type = "v5_beta"
-    window = 80  # This is the window size used in the paper.
-    data_dir = "/vision/u/chpatel/data/egoexo4d_ee4d_motion"
-    out_file = f"{data_dir}/uniegomotion/{repre_type}_ee_train_stats.pt"
-
-    if os.path.exists(out_file):
-        logger.info(f"{out_file} exists. Skipping.")
-        return
-
-    dataset = EE4D_Motion_Dataset(
-        data_dir=data_dir,
-        split="train",
-        repre_type=repre_type,
-        cond_traj=True,
-        cond_img_feat=False,
-        window=window,
-        img_feat_type="clip_all",
-        do_normalization=False,
-        cond_betas=False,
-    )
-
-    all_motion = []
-    all_traj = []
-    for sample in tqdm(dataset):
-        vf = sample["y"]["valid_frames"].bool()
-        motion = sample["misc"]["motion"][vf]
-        traj = sample["misc"]["traj"][vf]
-        all_motion.append(motion)
-        all_traj.append(traj)
-    all_motion = torch.cat(all_motion, dim=0)  # T_dataset x F
-    all_traj = torch.cat(all_traj, dim=0)  # T_dataset x F
-
-    stats = {}
-    stats["motion_mean"] = all_motion.mean(dim=0)
-    stats["motion_std"] = all_motion.std(dim=0)
-    stats["motion_min"] = all_motion.min(dim=0).values
-    stats["motion_max"] = all_motion.max(dim=0).values
-
-    stats["traj_mean"] = all_traj.mean(dim=0)
-    stats["traj_std"] = all_traj.std(dim=0)
-    stats["traj_min"] = all_traj.min(dim=0).values
-    stats["traj_max"] = all_traj.max(dim=0).values
-
-    torch.save(stats, out_file)
-
-
-def vis_a_sample():
-    data_dir = "/vision/u/chpatel/data/egoexo4d_ee4d_motion"
-    out_dir = "/vision/u/chpatel/test"
-    window = 80
-    use_blender = False  # use_blender=True for blendify blender visualization if available.
-
-    os.makedirs(out_dir, exist_ok=True)
-
-    dataset = EE4D_Motion_Dataset(
-        data_dir=data_dir,
-        window=window,
-        split="val",
-        # The following args are not important for visualization.
-        repre_type="v1",
-        cond_traj=True,
-        cond_img_feat=False,
-        cond_betas=False,
-        img_feat_type="dinov2",
-        do_normalization=False,
-    )
-
-    # After processing, each take is broken down into several 'good' segments, discarding segments with bad optim results.
-    # Thus each sequence name is '<take_name>___<start_frame_index>___<end_frame_index>' where frame indices are according
-    # to 30fps numbering and inclusive. Note that EE4D Motion dataset is at 10 fps. For example,
-    # uniandes_basketball_003_42___585___825 sequence will have smpl motion sequence of length (825 - 585) / 3 + 1 = 81 at 10fps.
-
-    # You can print all sequence names for that particular split
-    # print(dataset.seq_names)
-
-    # Choose a sequence to visualize
-    seq = "iiith_cooking_58_2___2478___3498"
-    seq = "uniandes_basketball_003_42___585___825"
-
-    # Choose start index within that segment. It will visualize the segment [st:st+window] within `seq`
-    st = 0
-
-    sample = dataset.get_from_seq_and_st(seq, st, idx=0)  # idx=0 is for bookkeeping during training. Ignore it here.
-    imgs = dataset.visualize_sample(sample, use_blender=use_blender)
-    save_video(imgs[..., ::-1], f"{seq}___starting_{st}", out_dir, fps=10)
-
-    import IPython
-
-    IPython.embed()
-
-
-if __name__ == "__main__":
-
-    save_statistics()
-    # vis_a_sample()
-
-    import IPython
-
-    IPython.embed()
