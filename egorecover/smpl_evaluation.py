@@ -117,12 +117,21 @@ def prepare_ground_truth(smpl, supervision, frame_indices, *, batch_size=32, aud
         vertices.append(output.vertices.cpu())
     joints = torch.cat(joints)
     vertices = torch.cat(vertices)
-    recorded = _tensor(supervision["kp3d"][select, :22], "cpu")
-    difference = (joints[:, :22] - recorded).norm(dim=-1)
-    audit = {"mean_mm": float(difference.mean() * 1000), "max_mm": float(difference.max() * 1000)}
+    recorded = _tensor(supervision["kp3d"][select, :55], "cpu")
+    if recorded.shape != joints.shape:
+        raise ValueError("EE4D GT must contain the first 55 SMPL-X body/hand joints.")
+    difference = (joints - recorded).norm(dim=-1)
+    audit = {
+        "mean_mm": float(difference.mean() * 1000),
+        "max_mm": float(difference.max() * 1000),
+        "body_mean_mm": float(difference[:, :22].mean() * 1000),
+        "body_max_mm": float(difference[:, :22].max() * 1000),
+        "hands_mean_mm": float(difference[:, 25:55].mean() * 1000),
+        "hands_max_mm": float(difference[:, 25:55].max() * 1000),
+    }
     if audit["mean_mm"] > audit_tolerance_mm or audit["max_mm"] > 4 * audit_tolerance_mm:
         raise ValueError(
-            "This SMPL-X asset/coordinate convention does not reproduce EE4D GT: "
+            "This SMPL-X asset/coordinate convention does not reproduce EE4D GT body/hand joints: "
             f"mean={audit['mean_mm']:.3f} mm, max={audit['max_mm']:.3f} mm."
         )
     if not bool(torch.isfinite(joints).all()) or not bool(torch.isfinite(vertices).all()):
@@ -132,7 +141,7 @@ def prepare_ground_truth(smpl, supervision, frame_indices, *, batch_size=32, aud
         "joints": joints,
         "vertices": vertices,
         "head_rotation": global_rotations[15].cpu(),
-        "recorded_body": recorded,
+        "recorded_body": recorded[:, :22],
         "floor_height_m": float(supervision["floor_height"]),
         "asset_audit": audit,
     }
@@ -225,6 +234,7 @@ def evaluate_saved_case(smpl, codec, saved, ground_truth, *, fault_onset, batch_
             "dense22_mm_recomputed": float(dense_error),
             "committed_dense_max_abs_m": dense_roundtrip,
             "fk_vs_dense_body_mm": float((joints[:, :22] - state.joints[..., :3, 3].cpu()).norm(dim=-1).mean() * 1000),
+            "fk_vs_dense_root_mm": float((joints[:, 0] - state.joints[:, 0, :3, 3].cpu()).norm(dim=-1).mean() * 1000),
             "floor_estimate_minus_annotation_m": float(saved["floor_estimate_m"]) - floor,
         },
     }

@@ -48,7 +48,7 @@ def main():
     model_file = model_dir / "SMPLX_NEUTRAL.npz"
     if not model_file.is_file():
         parser.error(
-            f"Authorized SMPL-X v1.1 neutral asset missing: {model_file}. "
+            f"Authorized SMPL-X neutral asset missing: {model_file}. "
             "Download it from the registered SMPL-X website; do not generate metrics without it."
         )
     # Keep the factory, asset fingerprint, and GT audit on the same file.
@@ -131,6 +131,9 @@ def main():
         "ground_truth_usage": "offline SMPL-X asset audit and metric calculation after inference",
         "floor_for_foot_metrics": "source annotation, offline evaluation only",
         "smplx_asset_sha256": file_sha256(model_file),
+        "model_bundle_version": (
+            (model_dir / "version.txt").read_text().strip() if (model_dir / "version.txt").is_file() else None
+        ),
         "stats_sha256": file_sha256(stats_path),
         "source_rollout_report_sha256": file_sha256(args.rollout / "report.json"),
         "gt_asset_audit": ground_truth["asset_audit"],

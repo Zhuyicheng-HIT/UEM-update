@@ -466,3 +466,18 @@ v3 两个开发 take × 2 种源 × 3 种观测变体的 **12 条**常规回放�
 - 对真实 v3 两个开发 take 的 **12 条、2160 帧**已保存预测轨迹完成无资产预检：预测状态与保存 dense 世界关节最大往返差 **9.53674e-7 m**；重算 dense22 与原闭环报告最大差 **3.05176e-5 mm**。结果 `verification/smplx_prediction_preflight.json` 明确标注 `actual_smplx_geometry_evaluated=false`。
 - 新增模拟人体 layer 的正反测试，验证固定启动体型、预测 FK、身体/手部误差、GT 资产不匹配和预测轨迹篡改拒绝。完整测试 **56 passed**，Black 检查通过；缺模型 CLI 以退出码 2 明确报错且不写指标文件。模拟层不能证明真实 SMPL-X 模型与 EE4D 标注一致。
 - 一旦获得官方授权文件，放入 `body_models/smplx/SMPLX_NEUTRAL.npz`，在 `egorecover` 环境从仓库根目录运行 `python -m run.evaluate_closed_loop_smplx --rollout exp/egorecover_closed_loop_v3_take0 --output exp/egorecover_closed_loop_v3_take0/smplx_geometry.json --smplx-dir body_models/smplx --device cuda`。这会先审计实际资产；若审计失败，须查版本/关节顺序/坐标与 PCA 基底，不能强行发表指标。详细说明见 `EGORECOVER.md`。
+
+## 2026-09-23 11:42 +08:00：授权模型到位，真实 SMPL-X 几何评估完成
+
+- 用户已将 `SMPLX_NEUTRAL.npz` 放入本地 `body_models/smplx/`。随包 `version.txt` 写明 **Version 1.0**，故更正此前代码/说明中未经资产核对的“v1.1”字样。模型 SHA256 为 `376021446ddc86e99acacd795182bbef903e61d33b76b9d8b359c2b0865bd992`；仓库仍忽略整个 `body_models/`，不上传许可资产。
+- 先用真实模型重建原始 EE4D 的 55 个身体/手部 GT 关节。足球/Covid 开发 take 的平均差分别为 **0.00088/0.00064 mm**、最大差 **0.0485/0.0925 mm**，远低于预设 5/20 mm 审计阈值。身体和手部一起审计，防止错误手 PCA 基底静默污染手指标。
+- 两个开发 take × Gaussian/History × clean/freeze/drift = **12 条、2160 帧**保存的模型预测历史全部通过真实 SMPL-X 前向、mesh 输出、完整指标计算和原 dense22 报告复核。无 GT 身体/体型/地面进入预测或 FK；GT 只用于推理结束后的审计和误差/足地面指标。
+
+| SMPL22 MPJPE / PA-MPJPE (mm)，后 180 帧 | Gaussian clean | Gaussian freeze | Gaussian drift | History clean | History freeze | History drift |
+|---|---:|---:|---:|---:|---:|---:|
+| 足球 | 172.38 / 75.79 | 172.33 / 75.77 | 173.47 / 75.54 | 196.88 / 98.70 | 196.84 / 98.68 | 197.57 / 98.65 |
+| Covid | 261.24 / 106.80 | 261.55 / 106.41 | 262.80 / 106.85 | 256.81 / 133.72 | 256.81 / 133.62 | 257.99 / 133.68 |
+
+- 完整结果（55 关节/身体/手部 MPJPE 与 PA、头旋转/位移、root、足滑/穿透/腾空/接触、三阶段分段值、审计和文件哈希）见 `exp/egorecover_closed_loop_v3_take0/smplx_geometry.json`、`exp/egorecover_closed_loop_v3_take1/smplx_geometry.json` 和 `verification/smplx_geometry_summary.json`。同一足球/Covid clean Gaussian 的旧 dense22 为 **154.58/220.95 mm**，真实固定体型 FK 后是 **172.38/261.24 mm**，不能混称。
+- clean Gaussian 的固定体型 FK 与直接 dense22 的平均关节差是 **70.77/89.06 mm**，但根关节差仅约 **0.00006/0 mm**。在离线诊断中保持相同预测旋转、改用每帧预测 β 后，差降至 **47.51/43.49 mm**：固定 β 带来部分差异，其余说明直接关节与旋转/骨架预测也不完全自洽。该逐帧 β 只用于问题定位，**正式指标仍严格固定启动 β_boot**。
+- 环境 `egorecover` 的完整回归 **56 passed**，Black 检查通过。尚无预训练 E7 初始化器、独立测试集或论文 80 帧协议；TMR/FID 未计算。上表是授权真实模型上的工程开发数据人体指标，不能宣称论文可比精度或方法优越性。下一阶段应针对预测姿态与直接关节的不自洽训练/选模，并在有效初始化与独立测试上重评；实际 SMPL-X 链路本身已接通。

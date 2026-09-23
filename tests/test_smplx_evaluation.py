@@ -88,6 +88,8 @@ def test_saved_predictions_flow_through_fk_and_paper_geometry_metrics():
     assert output["frames"] == 3
     assert output["diagnostics"]["committed_dense_max_abs_m"] < 1e-5
     assert output["diagnostics"]["fk_vs_dense_body_mm"] < 0.01
+    assert output["diagnostics"]["fk_vs_dense_root_mm"] < 0.01
+    assert gt["asset_audit"]["hands_max_mm"] < 0.01
     assert output["metrics"]["mpjpe_body_m"] == pytest.approx(0.1, abs=1e-6)
     assert output["metrics"]["mpjpe_hands_m"] == pytest.approx(0.1, abs=1e-6)
     assert output["metrics"]["mpjpe_body_pa_m"] < 1e-5
@@ -96,7 +98,7 @@ def test_saved_predictions_flow_through_fk_and_paper_geometry_metrics():
 
 def test_incompatible_gt_asset_or_tampered_prediction_is_rejected():
     smpl, codec, saved, supervision = fixture_case()
-    supervision["kp3d"] = supervision["kp3d"] + 0.1
+    supervision["kp3d"][:, 25:55] += 0.1  # A wrong hand PCA basis must fail even when body joints match.
     with pytest.raises(ValueError, match="does not reproduce EE4D GT"):
         prepare_ground_truth(smpl, supervision, saved["frame_indices"])
     saved["dense_world_joints"] = saved["dense_world_joints"] + 0.1
