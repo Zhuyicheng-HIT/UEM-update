@@ -2,7 +2,7 @@
 
 实现依据 EgoRecover 设计文档。逐阶段实验与问题见 [`LOG.md`](LOG.md)。原 E7 网络、注意力块、Flow 求解器与训练入口保持原样；新增代码从独立入口使用。
 
-当前已实现历史条件 G、当前帧 Flow、P/Q 网络、四动作、E7/EMA 初始化、几何 codec、物理缓存、在线回放、物理损失/选模和预测历史混合训练入口。正式独立训练评估、SMPL22 FK 收益标签与 Q 训练仍需有效启动、SMPL-X 资产及正式训练集。工程 checkpoint 不是正式模型。
+当前已实现历史条件 G、当前帧 Flow、P/Q 网络、四动作、E7/EMA 初始化、几何 codec、物理缓存、在线回放、物理损失/选模、预测历史混合训练入口和离线 SMPL-X 几何评估入口。正式独立训练评估、SMPL22 FK 收益标签与 Q 训练仍需有效启动、SMPL-X 资产及正式训练集。工程 checkpoint 不是正式模型。
 
 ## Conda 环境
 
@@ -72,7 +72,7 @@ report = load_e7_weights(model, "/linux/path/to/e7.ckpt", weight_source="ema")
 - 默认 `reference_mode="planar"`：启动、目标重编码、当前解码和缓存 reference 始终为 heading + 水平 x/y。身体关节和相机仍是三维姿态。`legacy_se3` 仅用于重现旧的自由三维参考行为；Flow 中间噪声不做平面投影。
 - 当前轨迹的 18D 后半段也连接此前提交的 reference。对齐的干净历史下与 E7 的相邻 reference 一致；预测漂移下形成需要训练适配的新输入分布。
 - `HistoryBuffer.from_bootstrap()` 只接模型生成的 20 帧启动结果；`decode_candidate()` 不写缓存；`commit()` 只接一帧预测，严格检查连续时间。β_boot 在启动后固定保存，正式 FK 解码需显式使用它；当前 dense 解码不做 SMPL FK。
-- `FixedShapeFK(smpl, beta_boot)` 接收实际 SMPL-X layer，在固定启动体型上由预测全局旋转恢复局部旋转，并以预测骨盆构造平移。只通过了模拟 layer 的语义测试，尚未取得模型资产进行正式验证。FK 输出用于评估，不替换 dense 历史状态。
+- `FixedShapeFK(smpl, beta_boot)` 接收实际 SMPL-X layer，在固定启动体型上由预测全局旋转恢复局部旋转，并以预测骨盆构造平移。可输出 55 关节与 mesh 顶点。只通过了模拟 layer 的语义测试，尚未取得模型资产进行正式验证。FK 输出用于评估，不替换 dense 历史状态。
 - `HistoryPrior` 只读身体历史，在 codec 的物理保持先验上预测修正；`freeze()` 同时关闭梯度和 dropout，并抵抗父 module 的 `.train()`。
 - 常速度基线在世界坐标外推位置，在 SO(3) 外推身体/参考旋转；手 PCA、contact、beta 保持末帧。
 - `UtilityPredictor` 读取身体历史、μ、截至当前的观测和可选合法兼容性；在 G 前输出三个相对收益。`generate_utility_labels()` 仅离线调用，传入 a11 可用性条件和共享噪声；真实收益的 error_fn 应为公共坐标 SMPL22 FK 误差。
@@ -134,6 +134,23 @@ python -m run.compare_closed_loop_baselines --rollout exp/my_closed_loop
 ```
 
 `body_baselines.json` 只报告 dense22 位置；它没有身体旋转/FK 指标。随机初始化器最后两帧的速度噪声在长时外推时可能使常速度基线很差，不能与每步有 GT 历史的单步常速度混为一谈。两种协议的历史来源和启动误差必须一起阅读。
+
+## 离线 SMPL-X 几何评估
+
+官方 [SMPL-X 下载页](https://smpl-x.is.tue.mpg.de/download.php) 要求注册、登录并同意模型许可。取得 SMPL-X v1.1 的 `SMPLX_NEUTRAL.npz` 后，将它放入当前仓库的 `body_models/smplx/`，或通过 `--smplx-dir` 指向所在目录。`pip install smplx` 只安装 Python 代码，不包含模型文件；模型资产不要提交至 Git。当前工作区缺此文件，因而**尚无实际 SMPL-X 数值报告**。
+
+```bash
+conda activate egorecover
+cd /home/ld666/projects/EgoRecover/UEM-E7
+python -m run.evaluate_closed_loop_smplx \
+  --rollout exp/egorecover_closed_loop_v3_take0 \
+  --output exp/egorecover_closed_loop_v3_take0/smplx_geometry.json \
+  --smplx-dir body_models/smplx --device cuda
+```
+
+评估器只读取已经完成的预测历史轨迹。每帧从保存的 `committed_motion` 和 reference 恢复预测姿态，以启动阶段模型自身的 `beta_boot` 固定体型，调用 SMPL-X 得到关节和顶点。GT 只在**推理后**用于模型资产/坐标约定审计和误差计算；GT 前 22 关节与给定模型重建均值需在 5 mm 内、最大值在 20 mm 内，异常则终止且不写报告。还校验恢复的 dense22 与保存轨迹相符、与原闭环报告误差相符。手/身体 MPJPE 与逐帧 PA、头部旋转与眼关节位移、足部滑动/穿透/腾空/接触均沿用原 `eval.metrics` 几何定义；足部指标使用标注地面高度，并在报告中注明。`TMR` 语义相似度和 FID 还需要独立预训练编码器及论文的采样协议，此入口不计算它们。现有 200 帧工程片段的后 180 帧，也不能直接与论文的 80 帧正式验证数值比较。
+
+在模型文件到位前，已对真实保存的 12 条闭环轨迹、2160 帧完成预测状态解码预检；最大关节位置往返差 `9.53674e-7 m`，结果在 [`smplx_prediction_preflight.json`](verification/smplx_prediction_preflight.json)。这只是轨迹接入预检，不是人体模型指标。
 
 历史记录：v0（G 各 100 步）与 v1（G 各 1000 步）使用旧的自由三维 reference。v1 同组 64 帧误差为常速度 15.17 mm、P 38.15 mm、Gaussian G 152.77 mm、History G 168.24 mm；随机启动曾在索引 98 发散。当前参考系修复之后的实验另存，不覆盖这些结果，最新数值见 LOG。
 

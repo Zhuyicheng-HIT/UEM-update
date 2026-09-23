@@ -26,7 +26,7 @@ class FixedShapeFK(nn.Module):
         ):
             raise ValueError("Expected topologically ordered SMPL22 parents.")
         with torch.no_grad():
-            root = self.smpl(betas=self.beta_boot[None]).joints[0, 0]
+            root = self.smpl(betas=self.beta_boot[None], return_verts=False).joints[0, 0]
         self.register_buffer("root_offset", root.detach().clone())
 
     def train(self, mode=True):
@@ -34,9 +34,17 @@ class FixedShapeFK(nn.Module):
         self.smpl.eval()
         return self
 
-    def forward(self, state):
+    def project(self, state, *, joint_count=22, return_verts=False):
+        """Evaluate the predicted body with fixed startup shape.
+
+        The full 55-joint output supports UniEgoMotion's body, eye/head and
+        hand metrics. Vertices are requested only for its floor-contact metric.
+        This function never reads supervision or adjusts a predicted state.
+        """
         if state.joints.shape[-3:] != (22, 4, 4) or state.auxiliary.shape[-1] != 36:
             raise ValueError("Expected dense BodyState with 22 transforms and 36 auxiliary channels.")
+        if isinstance(joint_count, bool) or not isinstance(joint_count, int) or joint_count < 1:
+            raise ValueError("joint_count must be a positive integer.")
         prefix = state.joints.shape[:-3]
         if state.auxiliary.shape[:-1] != prefix:
             raise ValueError("Body transforms and auxiliary channels must have identical batch dimensions.")
@@ -62,9 +70,20 @@ class FixedShapeFK(nn.Module):
             transl=joints[:, 0, :3, 3] - self.root_offset,
             left_hand_pose=pca_to_matrix(auxiliary[:, :12], self.smpl.left_hand_components),
             right_hand_pose=pca_to_matrix(auxiliary[:, 12:24], self.smpl.right_hand_components),
-            return_verts=False,
+            return_verts=return_verts,
         )
-        result = output.joints[:, :22].reshape(*prefix, 22, 3)
+        if output.joints.shape[1] < joint_count:
+            raise ValueError(f"SMPL layer exposes {output.joints.shape[1]} joints; need {joint_count}.")
+        result = output.joints[:, :joint_count].reshape(*prefix, joint_count, 3)
         if not bool(torch.isfinite(result).all()):
             raise ValueError("SMPL FK produced nonfinite joints.")
-        return result
+        vertices = None
+        if return_verts:
+            vertices = getattr(output, "vertices", None)
+            if vertices is None or vertices.shape[0] != count or not bool(torch.isfinite(vertices).all()):
+                raise ValueError("SMPL FK did not produce finite vertices.")
+            vertices = vertices.reshape(*prefix, vertices.shape[1], 3)
+        return result, vertices
+
+    def forward(self, state):
+        return self.project(state)[0]

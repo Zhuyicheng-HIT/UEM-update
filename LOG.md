@@ -458,3 +458,11 @@ v3 两个开发 take × 2 种源 × 3 种观测变体的 **12 条**常规回放�
 - `verification/egorecover_repair_summary.json`、`egorecover_repair_summary.png`、`egorecover_repair_summary.pdf`：整合源码 SHA256、模型/缓存身份、回归/适配检查、单步与闭环不同协议；图已打开检查。
 
 **当前可行性判断**：公共坐标和因果滚动接口在这批工程数据上已可稳定执行，预测历史适配有同视频闭环改进证据；方法精度仍未成立。没有真实训练过的 E7 启动权重、实际 SMPL-X FK 资产与独立测试集准确率；P 被选为未训练的零修正，Q 尚未正式训练，两个分支的 GT-history 单步误差均高于真实历史常速度。当前数据来自官方 val 的工程划分；holdout 未被用于选择。故本轮结束于**修复与有限工程验收**，不延伸为论文指标或方法优越性声明。按用户指令，记录完毕即停止，不再开启新训练/实验。
+
+## 2026-09-23 11:33 +08:00：离线 SMPL-X 人体评估链路接入与资产阻断
+
+- 用户随后要求接通完整 SMPL-X 链路并直接下载模型。已核实 [SMPL-X 官方站](https://smpl-x.is.tue.mpg.de/)明确要求注册及同意许可，匿名打开 [下载页](https://smpl-x.is.tue.mpg.de/download.php) 会跳到登录页。当前 WSL 未找到 `SMPLX_NEUTRAL.npz`，无法代表用户完成站点注册/许可同意或取得授权下载。因此**实际模型资产未下载、未生成实际 SMPL-X 指标**；没有用来路不明的镜像文件替代。
+- 新增 `egorecover/smpl_evaluation.py` 和 `run/evaluate_closed_loop_smplx.py`：从已完成的预测历史回放恢复每帧身体，用模型自身启动 `beta_boot` 固定体型；运行 SMPL-X 得到 55 关节和 mesh 顶点；从干净原始序列离线生成 GT，先用前 22 关节审计模型文件与标注坐标是否匹配，再计算身体/手部 MPJPE 与 PA、头部旋转/平移、根位移、足部滑动/穿透/腾空/接触。按整体、故障前、故障中和恢复期分别报告；TMR/FID 与论文正式采样协议仍不在这个工程入口内。
+- 对真实 v3 两个开发 take 的 **12 条、2160 帧**已保存预测轨迹完成无资产预检：预测状态与保存 dense 世界关节最大往返差 **9.53674e-7 m**；重算 dense22 与原闭环报告最大差 **3.05176e-5 mm**。结果 `verification/smplx_prediction_preflight.json` 明确标注 `actual_smplx_geometry_evaluated=false`。
+- 新增模拟人体 layer 的正反测试，验证固定启动体型、预测 FK、身体/手部误差、GT 资产不匹配和预测轨迹篡改拒绝。完整测试 **56 passed**，Black 检查通过；缺模型 CLI 以退出码 2 明确报错且不写指标文件。模拟层不能证明真实 SMPL-X 模型与 EE4D 标注一致。
+- 一旦获得官方授权文件，放入 `body_models/smplx/SMPLX_NEUTRAL.npz`，在 `egorecover` 环境从仓库根目录运行 `python -m run.evaluate_closed_loop_smplx --rollout exp/egorecover_closed_loop_v3_take0 --output exp/egorecover_closed_loop_v3_take0/smplx_geometry.json --smplx-dir body_models/smplx --device cuda`。这会先审计实际资产；若审计失败，须查版本/关节顺序/坐标与 PCA 基底，不能强行发表指标。详细说明见 `EGORECOVER.md`。

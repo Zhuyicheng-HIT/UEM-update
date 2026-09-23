@@ -2,6 +2,8 @@
 
 本分支保存新接口、测试、实验报告和逐帧**模型预测**，方便核对已经完成的修正。完整阶段记录见 [LOG.md](LOG.md)，接口与复跑说明见 [EGORECOVER.md](EGORECOVER.md)。数值是官方验证数据的工程划分、随机 E7 初始化器和 dense22 世界关节位置误差；不代表正式 SMPL-X FK 结果。
 
+新增 [SMPL-X 预测轨迹预检](verification/smplx_prediction_preflight.json)：12 条、2160 帧的预测状态恢复与原 dense22 报告一致；尚缺官网授权的 `SMPLX_NEUTRAL.npz`，因此无实际 SMPL-X 指标。资产到位后的审计及复跑命令见 [评估说明](EGORECOVER.md#离线-smpl-x-几何评估)。
+
 ## 已上传的报告
 
 - [修正汇总 JSON](verification/egorecover_repair_summary.json)、[PNG](verification/egorecover_repair_summary.png)、[PDF](verification/egorecover_repair_summary.pdf)：参考系修正、物理选模、预测历史适配及 20 条闭环回放的对照。
